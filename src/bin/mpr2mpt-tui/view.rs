@@ -286,7 +286,7 @@ fn file_style(kind: Kind, path: &Path) -> (&'static str, &'static str, Color) {
         Kind::Directory => return ("\u{f07b}", "▸", Color::LightBlue),
         Kind::Mpr => return ("\u{f0c3}", "◇", Color::LightYellow),
         Kind::Mps => return ("\u{f1de}", "⚙", Color::LightMagenta),
-        Kind::Mpt => return ("\u{f0ce}", "≡", Color::LightCyan),
+        Kind::Mpt => return ("\u{f0ce}", "≡", Color::LightGreen),
         Kind::Other => {}
     }
     let extension = path
@@ -450,6 +450,7 @@ mod tests {
         ];
         assert_ne!(measurements[0].2, measurements[1].2);
         assert_ne!(measurements[1].2, measurements[2].2);
+        assert_eq!(measurements[2].2, Color::LightGreen);
         let image = file_style(Kind::Other, Path::new("figure.PNG"));
         let doc = file_style(Kind::Other, Path::new("reference.pdf"));
         assert_eq!(image.2, Color::Reset);
