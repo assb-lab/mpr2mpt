@@ -8,6 +8,8 @@ use openreadout_echem::MprReader;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
+pub mod batch;
+
 const CHUNK_ROWS: u64 = 4096;
 const FLAG_IDS: [u16; 6] = [1, 2, 3, 21, 31, 65];
 const TIME_ID: u16 = 4;
@@ -37,6 +39,10 @@ pub enum ConversionError {
     OutputName(PathBuf),
     #[error("output already exists: {0}")]
     OutputExists(PathBuf),
+    #[error("multiple batch jobs resolve to the same output: {0}")]
+    DuplicateBatchOutput(PathBuf),
+    #[error("cannot verify batch output {path}: {reason}")]
+    BatchOutputVerification { path: PathBuf, reason: String },
     #[error("cannot write MPT {path}: {source}")]
     OutputIo { path: PathBuf, source: io::Error },
 }
