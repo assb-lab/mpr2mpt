@@ -59,10 +59,10 @@ impl Browser {
             kind: kind
                 .or_else(|| measurement_kind(&absolute))
                 .unwrap_or_else(|| {
-                    if is_text_preview(&absolute) {
-                        Kind::Other
-                    } else {
+                    if super::preview::has_mpr_signature(&absolute) {
                         Kind::Mpr
+                    } else {
+                        Kind::Other
                     }
                 }),
         });
@@ -136,23 +136,29 @@ impl Browser {
 
     pub(super) fn set_filter(&mut self, query: String) {
         self.filter = query;
-        self.update_files(0);
+        self.update_files(1);
     }
 
     fn update_files(&mut self, fallback: usize) {
-        let before = self.selected().map(|entry| entry.path.clone());
+        let before = self
+            .selected()
+            .filter(|entry| entry.path != self.directory)
+            .map(|entry| entry.path.clone());
+        // With no previous file rows, prefer the first real entry if one appears.
+        let fallback = if self.files.len() <= 1 { 1 } else { fallback };
         let explicit = self.explicit.as_ref().map(|entry| &entry.path);
         let query = self.filter.to_lowercase();
-        self.files = self
-            .all_files
-            .iter()
-            .filter(|entry| {
-                (!self.restricted || entry.kind != Kind::Other || explicit == Some(&entry.path))
-                    && (self.show_hidden || !is_hidden(&entry.path))
-                    && (query.is_empty() || entry.label.to_lowercase().contains(&query))
-            })
-            .cloned()
-            .collect();
+        let current = Entry {
+            path: self.directory.clone(),
+            label: ".".into(),
+            kind: Kind::Directory,
+        };
+        let visible = self.all_files.iter().filter(|entry| {
+            (!self.restricted || entry.kind != Kind::Other || explicit == Some(&entry.path))
+                && (self.show_hidden || !is_hidden(&entry.path))
+                && (query.is_empty() || entry.label.to_lowercase().contains(&query))
+        });
+        self.files = std::iter::once(current).chain(visible.cloned()).collect();
         self.cursor = fallback.min(self.files.len().saturating_sub(1));
         if let Some(path) = before {
             self.focus_path(&path);
@@ -195,14 +201,6 @@ fn measurement_kind(path: &Path) -> Option<Kind> {
     } else {
         None
     }
-}
-
-pub(super) fn is_text_preview(path: &Path) -> bool {
-    path.extension().is_some_and(|suffix| {
-        ["txt", "md", "markdown", "csv", "tsv"]
-            .iter()
-            .any(|extension| suffix.eq_ignore_ascii_case(extension))
-    })
 }
 
 pub(super) fn terminal_text(path: &Path) -> String {
@@ -269,7 +267,7 @@ mod tests {
         fs::write(folder.join("first.mpt"), []).unwrap();
 
         let browser = Browser::open(&input).unwrap();
-        assert_eq!(browser.files.len(), 2);
+        assert_eq!(browser.files.len(), 3);
         assert_eq!(browser.selected().unwrap().label, "sample.MPR");
         let parent = browser.enter_parent().unwrap().unwrap();
         assert_eq!(parent.selected().unwrap().label, "測定");
@@ -279,7 +277,10 @@ mod tests {
     fn focuses_explicit_inputs_outside_the_default_suffix_filter() {
         let scratch = tempdir().unwrap();
         let input = scratch.path().join("measurement");
-        fs::write(&input, []).unwrap();
+        let mut header = b"BIO-LOGIC MODULAR FILE\x1a".to_vec();
+        header.resize(52, 0);
+        header.extend(b"MODULE");
+        fs::write(&input, header).unwrap();
         fs::write(scratch.path().join("aaa.mpr"), []).unwrap();
 
         let browser = Browser::open(&input).unwrap();

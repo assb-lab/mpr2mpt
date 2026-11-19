@@ -3,6 +3,8 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
 
+use openreadout_core::FormatReader;
+use openreadout_echem::MprReader;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Style};
@@ -31,9 +33,25 @@ pub(super) struct TextPreview {
 }
 
 impl TextPreview {
-    pub(super) fn load(path: &Path) -> io::Result<Self> {
-        let (bytes, truncated) = read_preview(path)?;
-        let lines: Vec<_> = decode_preview(&bytes, truncated)
+    pub(super) fn load(path: &Path) -> io::Result<Option<Self>> {
+        let Some((bytes, truncated)) = read_preview(path)? else {
+            return Ok(None);
+        };
+        let Some(text) = decode_text(&bytes, truncated).filter(|text| {
+            // Allow occasional controls in text logs, but never accept NUL.
+            !text.contains('\0')
+                && text
+                    .chars()
+                    .filter(|&character| {
+                        character.is_control()
+                            && !matches!(character, '\n' | '\r' | '\t' | '\x0c' | '\x1b')
+                    })
+                    .nth(1 + text.len() / 100)
+                    .is_none()
+        }) else {
+            return Ok(None);
+        };
+        let lines: Vec<_> = text
             .lines()
             .map(|line| super::safe_text(&line.replace('\t', "    ")))
             .collect();
@@ -43,11 +61,11 @@ impl TextPreview {
             .max()
             .unwrap_or(0)
             .min(usize::from(u16::MAX) + 1);
-        Ok(Self {
+        Ok(Some(Self {
             lines,
             columns,
             truncated,
-        })
+        }))
     }
 
     pub(super) fn rows(&self) -> usize {
@@ -119,7 +137,12 @@ impl From<mpr2mpt::Inspection> for InspectionView {
 
 impl MptPreview {
     pub(super) fn load(path: &Path) -> io::Result<Self> {
-        let (mut bytes, byte_limit_reached) = read_preview(path)?;
+        let (mut bytes, byte_limit_reached) = read_preview(path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Preview requires a regular file",
+            )
+        })?;
         if byte_limit_reached {
             let end = bytes
                 .iter()
@@ -268,8 +291,21 @@ impl MptPreview {
     }
 }
 
-fn read_preview(path: &Path) -> io::Result<(Vec<u8>, bool)> {
-    require_regular_file(fs::metadata(path)?)?;
+pub(super) fn has_mpr_signature(path: &Path) -> bool {
+    let Ok(Some(mut file)) = open_preview_file(path) else {
+        return false;
+    };
+    // Check the first module after the 52-byte MPR preamble.
+    let mut header = [0; 58];
+    file.read_exact(&mut header).is_ok()
+        && header.ends_with(b"MODULE")
+        && MprReader.sniff(&header, path).is_some()
+}
+
+fn open_preview_file(path: &Path) -> io::Result<Option<File>> {
+    if !fs::metadata(path)?.is_file() {
+        return Ok(None);
+    }
     let mut options = File::options();
     options.read(true);
     #[cfg(unix)]
@@ -280,14 +316,40 @@ fn read_preview(path: &Path) -> io::Result<(Vec<u8>, bool)> {
         options.custom_flags(libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
-    require_regular_file(file.metadata()?)?;
+    Ok(file.metadata()?.is_file().then_some(file))
+}
 
+fn read_preview(path: &Path) -> io::Result<Option<(Vec<u8>, bool)>> {
+    let Some(file) = open_preview_file(path)? else {
+        return Ok(None);
+    };
     let mut bytes = Vec::new();
     file.take((PREVIEW_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
     let truncated = bytes.len() > PREVIEW_BYTES;
     bytes.truncate(PREVIEW_BYTES);
-    Ok((bytes, truncated))
+    Ok(Some((bytes, truncated)))
+}
+
+fn decode_text(bytes: &[u8], truncated: bool) -> Option<Cow<'_, str>> {
+    let (bytes, from_bytes): (_, fn([u8; 2]) -> u16) = match bytes {
+        [0xff, 0xfe, rest @ ..] => (rest, u16::from_le_bytes),
+        [0xfe, 0xff, rest @ ..] => (rest, u16::from_be_bytes),
+        _ => return Some(decode_preview(bytes, truncated)),
+    };
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    if !truncated && !remainder.is_empty() {
+        return None;
+    }
+    let mut units: Vec<_> = pairs.iter().copied().map(from_bytes).collect();
+    if truncated
+        && units
+            .last()
+            .is_some_and(|unit| (0xd800..=0xdbff).contains(unit))
+    {
+        units.pop();
+    }
+    String::from_utf16(&units).ok().map(Cow::Owned)
 }
 
 fn decode_preview(bytes: &[u8], truncated: bool) -> Cow<'_, str> {
@@ -320,17 +382,6 @@ fn fit_cell(value: &str, width: u16) -> Cell<'_> {
     }
     clipped.push('…');
     Cell::new(clipped)
-}
-
-fn require_regular_file(metadata: fs::Metadata) -> io::Result<()> {
-    if metadata.is_file() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Preview requires a regular file",
-        ))
-    }
 }
 
 fn invalid_header(message: &'static str) -> io::Error {
@@ -417,12 +468,39 @@ mod tests {
         content.resize(PREVIEW_BYTES - 1, b'a');
         content.extend_from_slice("測".as_bytes());
         let file = preview_file(&content);
-        let preview = TextPreview::load(file.path()).unwrap();
+        let preview = TextPreview::load(file.path()).unwrap().unwrap();
 
         assert!(preview.truncated);
         assert_eq!(preview.rows(), 2);
         assert!(preview.lines[1].starts_with("µ"));
         assert!(preview.lines[1].ends_with('a'));
+    }
+
+    #[test]
+    fn text_preview_reads_utf16_in_both_byte_orders() {
+        let encodings = [
+            ([0xff, 0xfe], u16::to_le_bytes as fn(u16) -> [u8; 2]),
+            ([0xfe, 0xff], u16::to_be_bytes),
+        ];
+        for (bom, to_bytes) in encodings {
+            let mut content = bom.to_vec();
+            content.extend("日本語\n🔬\n".encode_utf16().flat_map(to_bytes));
+            let file = preview_file(&content);
+            let preview = TextPreview::load(file.path()).unwrap().unwrap();
+            assert_eq!(preview.lines, ["日本語", "🔬"]);
+        }
+    }
+
+    #[test]
+    fn text_preview_sanitizes_incidental_controls_without_hiding_text() {
+        for (bytes, expected) in [
+            (&b"caf\xe9\x85line\n"[..], "café�line"),
+            (&b"ready\x07\n"[..], "ready�"),
+        ] {
+            let file = preview_file(bytes);
+            let preview = TextPreview::load(file.path()).unwrap().unwrap();
+            assert_eq!(preview.lines, [expected]);
+        }
     }
 
     #[test]

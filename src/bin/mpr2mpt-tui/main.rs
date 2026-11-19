@@ -416,6 +416,7 @@ impl App {
         let sources: Vec<_> = if self.marked.is_empty() {
             self.browser
                 .selected()
+                .filter(|entry| entry.path != self.browser.directory)
                 .map(|entry| entry.path.clone())
                 .into_iter()
                 .collect()
@@ -423,7 +424,7 @@ impl App {
             self.marked.iter().cloned().collect()
         };
         if sources.is_empty() {
-            self.message = Some("Select an item to copy.".into());
+            self.message = Some("Select a file or child folder to copy.".into());
             return;
         }
         self.message = Some(format!("{} item(s) ready to paste.", sources.len()));
@@ -464,8 +465,12 @@ impl App {
         if self.running.is_some() {
             self.message =
                 Some("Wait for the active conversion before moving files to Trash.".into());
-        } else if let Some(path) = self.browser.selected().map(|entry| entry.path.clone()) {
-            match trash::Target::new(path) {
+        } else if let Some(entry) = self.browser.selected() {
+            if entry.path == self.browser.directory {
+                self.message = Some("Select a file or child folder to move to Trash.".into());
+                return;
+            }
+            match trash::Target::new(entry.path.clone()) {
                 Ok(target) => self.trash_target = Some(target),
                 Err(error) => self.show_error(error),
             }
@@ -507,7 +512,11 @@ impl App {
 
     fn open_selection(&mut self) {
         match self.browser.selected() {
-            Some(entry) if entry.kind == Kind::Directory => self.open_path(entry.path.clone()),
+            Some(entry) if entry.kind == Kind::Directory => {
+                if entry.path != self.browser.directory {
+                    self.open_path(entry.path.clone());
+                }
+            }
             Some(entry) => {
                 if entry.kind == Kind::Mpr && !matches!(self.detail, Detail::Inspection(_)) {
                     self.open_inspection();
@@ -661,15 +670,11 @@ impl App {
                     Ok(preview) => Detail::Mpt(preview),
                     Err(error) => Detail::Error(error.to_string()),
                 },
-                Kind::Mps | Kind::Other
-                    if browser::is_text_preview(&entry.path) || entry.kind == Kind::Mps =>
-                {
-                    match TextPreview::load(&entry.path) {
-                        Ok(preview) => Detail::Text(preview),
-                        Err(error) => Detail::Error(error.to_string()),
-                    }
-                }
-                Kind::Mps | Kind::Other => Detail::Empty,
+                Kind::Mps | Kind::Other => match TextPreview::load(&entry.path) {
+                    Ok(Some(preview)) => Detail::Text(preview),
+                    Ok(None) => Detail::Empty,
+                    Err(error) => Detail::Error(error.to_string()),
+                },
             },
             None => Detail::Empty,
         };
@@ -1019,13 +1024,13 @@ mod navigation_tests {
         fs::write(scratch.path().join("Alpha.mpr"), []).unwrap();
         fs::write(scratch.path().join("beta.MPS"), []).unwrap();
         let mut app = app_at(scratch.path());
-        assert_eq!(app.browser.files.len(), 2);
+        assert_eq!(app.browser.files.len(), 3);
         app.key(key('f'));
         app.paste("BETA");
-        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.files.len(), 2);
         assert_eq!(app.browser.selected().unwrap().label, "beta.MPS");
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.browser.files.len(), 2);
+        assert_eq!(app.browser.files.len(), 3);
     }
 
     #[test]
@@ -1038,26 +1043,26 @@ mod navigation_tests {
 
         app.key(key('f'));
         app.key(key('b'));
-        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.files.len(), 2);
         assert_eq!(app.browser.selected().unwrap().label, "beta.mpr");
         app.key(enter);
 
         app.key(key('f'));
         assert!(app.prompt.as_ref().unwrap().field.value.is_empty());
         app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.files.len(), 2);
 
         app.key(key('l'));
         assert_eq!(app.browser.selected().unwrap().label, "alpha.mpr");
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.browser.selected().unwrap().label, "beta.mpr");
-        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.files.len(), 2);
 
         app.key(key('f'));
         app.key(enter);
         assert!(app.prompt.is_none());
         assert!(app.browser.filter.is_empty());
-        assert_eq!(app.browser.files.len(), 2);
+        assert_eq!(app.browser.files.len(), 3);
     }
 
     #[test]
@@ -1069,15 +1074,47 @@ mod navigation_tests {
         app.show_report = true;
         app.key(key('j'));
         assert!(!app.show_report);
-        assert_eq!(app.browser.cursor, 1);
+        assert_eq!(app.browser.selected().unwrap().label, "b.mpr");
         app.key(key('g'));
         assert!(app.prompt.is_none());
-        assert_eq!(app.browser.cursor, 1);
+        assert_eq!(app.browser.selected().unwrap().label, "b.mpr");
         app.key(key('g'));
-        assert_eq!(app.browser.cursor, 0);
+        assert_eq!(app.browser.selected().unwrap().label, ".");
         app.key(key('g'));
         assert!(!app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(app.prefix.is_none());
+    }
+
+    #[test]
+    fn current_directory_row_is_first_and_safe_inside_hidden_directories() {
+        let scratch = tempfile::tempdir().unwrap();
+        let directory = scratch.path().join(".measurements");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("sample.mpr"), []).unwrap();
+        let mut app = app_at(&directory);
+
+        app.key(key('g'));
+        app.key(key('g'));
+        let entry = app.browser.selected().unwrap();
+        assert_eq!(entry.label, ".");
+        assert_eq!(entry.path, directory.canonicalize().unwrap());
+        assert_eq!(entry.kind, Kind::Directory);
+
+        app.key(key('d'));
+        assert!(app.trash_target.is_none());
+        app.key(key('y'));
+        app.key(key('y'));
+        assert!(app.clipboard.is_empty());
+        app.key(key('l'));
+        assert_eq!(app.browser.selected().unwrap().label, ".");
+
+        app.key(key('f'));
+        app.paste("sample");
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.browser.selected().unwrap().label, "sample.mpr");
+        app.key(key('g'));
+        app.key(key('g'));
+        assert_eq!(app.browser.selected().unwrap().label, ".");
     }
 
     #[test]
@@ -1134,16 +1171,54 @@ mod navigation_tests {
     }
 
     #[test]
+    fn previews_text_without_requiring_a_known_extension() {
+        let scratch = tempfile::tempdir().unwrap();
+        for name in [
+            "Cargo.toml",
+            "config.yaml",
+            "data.json",
+            "main.rs",
+            "Makefile",
+        ] {
+            let path = scratch.path().join(name);
+            fs::write(&path, b"first line\nsecond line\n").unwrap();
+            let mut app = app_at(&path);
+            assert_eq!(app.browser.selected().unwrap().kind, Kind::Other);
+            assert!(matches!(app.detail, Detail::Text(_)));
+            app.key(key('l'));
+            app.key(key('G'));
+            assert_eq!(app.preview_row, 1);
+        }
+
+        let mut app = app_at(scratch.path());
+        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.selected().unwrap().label, ".");
+        app.key(key('m'));
+        assert!(matches!(app.detail, Detail::Text(_)));
+    }
+
+    #[test]
+    fn leaves_a_binary_file_with_a_text_extension_unfocused() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("binary.txt");
+        fs::write(&path, b"looks like text\n\0\xff\0").unwrap();
+        let mut app = app_at(&path);
+        assert!(matches!(app.detail, Detail::Empty));
+        app.key(key('l'));
+        assert!(!app.preview_focused);
+    }
+
+    #[test]
     fn toggles_between_measurement_files_and_all_files() {
         let scratch = tempfile::tempdir().unwrap();
         fs::write(scratch.path().join("a.mpr"), []).unwrap();
         fs::write(scratch.path().join("note.txt"), []).unwrap();
         let mut app = app_at(scratch.path());
-        assert_eq!(app.browser.files.len(), 1);
-        app.key(key('m'));
         assert_eq!(app.browser.files.len(), 2);
         app.key(key('m'));
-        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.files.len(), 3);
+        app.key(key('m'));
+        assert_eq!(app.browser.files.len(), 2);
     }
 
     #[test]
@@ -1166,15 +1241,16 @@ mod navigation_tests {
         fs::write(scratch.path().join(".root.mpr"), []).unwrap();
         fs::write(child.join(".child.mpr"), []).unwrap();
         let mut app = app_at(scratch.path());
-        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.files.len(), 2);
         assert!(matches!(&app.detail, Detail::Folder(entries) if entries.is_empty()));
         app.key(key('.'));
-        assert_eq!(app.browser.files.len(), 2);
+        assert_eq!(app.browser.files.len(), 3);
         assert!(matches!(&app.detail, Detail::Folder(entries) if entries.len() == 1));
         app.key(key('l'));
         assert_eq!(app.browser.selected().unwrap().label, ".child.mpr");
         app.key(key('.'));
-        assert!(app.browser.files.is_empty());
+        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.selected().unwrap().label, ".");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
