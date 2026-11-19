@@ -6,7 +6,7 @@ use std::path::Path;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
 const PREVIEW_BYTES: usize = 128 * 1024;
@@ -22,6 +22,81 @@ pub(super) struct InspectionView {
     pub(super) metadata: Vec<(String, String)>,
     pub(super) metadata_start: usize,
     pub(super) table: MptPreview,
+}
+
+pub(super) struct TextPreview {
+    lines: Vec<String>,
+    columns: usize,
+    truncated: bool,
+}
+
+impl TextPreview {
+    pub(super) fn load(path: &Path) -> io::Result<Self> {
+        let (bytes, truncated) = read_preview(path)?;
+        let lines: Vec<_> = decode_preview(&bytes, truncated)
+            .lines()
+            .map(|line| super::safe_text(&line.replace('\t', "    ")))
+            .collect();
+        let columns = lines
+            .iter()
+            .map(|line| Span::raw(line).width())
+            .max()
+            .unwrap_or(0)
+            .min(usize::from(u16::MAX) + 1);
+        Ok(Self {
+            lines,
+            columns,
+            truncated,
+        })
+    }
+
+    pub(super) fn rows(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub(super) fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub(super) fn draw(&self, frame: &mut Frame, area: Rect, column: usize, row: usize) {
+        if area.is_empty() {
+            return;
+        }
+        if self.lines.is_empty() {
+            frame.render_widget(Paragraph::new("Empty file"), area);
+            return;
+        }
+        let text_height = area.height - u16::from(area.height > 1);
+        let first = row.min(self.rows() - 1);
+        let last = (first + usize::from(text_height)).min(self.rows());
+        let lines: Vec<_> = self.lines[first..last]
+            .iter()
+            .map(|line| Line::raw(line.as_str()))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines).scroll((0, column as u16)),
+            Rect {
+                height: text_height,
+                ..area
+            },
+        );
+        if text_height < area.height {
+            let suffix = if self.truncated { "+" } else { "" };
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Lines {}–{last}/{}{suffix}",
+                    first + 1,
+                    self.rows()
+                ))
+                .style(Style::default().fg(Color::Gray)),
+                Rect {
+                    y: area.y + text_height,
+                    height: 1,
+                    ..area
+                },
+            );
+        }
+    }
 }
 
 impl From<mpr2mpt::Inspection> for InspectionView {
@@ -44,35 +119,15 @@ impl From<mpr2mpt::Inspection> for InspectionView {
 
 impl MptPreview {
     pub(super) fn load(path: &Path) -> io::Result<Self> {
-        require_regular_file(fs::metadata(path)?)?;
-        let mut options = File::options();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-
-            // A path can be replaced by a FIFO between metadata() and open().
-            options.custom_flags(libc::O_NONBLOCK);
-        }
-        let file = options.open(path)?;
-        require_regular_file(file.metadata()?)?;
-
-        let mut bytes = Vec::new();
-        file.take((PREVIEW_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        let byte_limit_reached = bytes.len() > PREVIEW_BYTES;
+        let (mut bytes, byte_limit_reached) = read_preview(path)?;
         if byte_limit_reached {
-            let end = bytes[..PREVIEW_BYTES]
+            let end = bytes
                 .iter()
                 .rposition(|byte| *byte == b'\n')
                 .map_or(0, |index| index + 1);
             bytes.truncate(end);
         }
-        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
-        let text = match str::from_utf8(bytes) {
-            Ok(text) => Cow::Borrowed(text),
-            Err(_) => Cow::Owned(bytes.iter().copied().map(char::from).collect::<String>()),
-        };
+        let text = decode_preview(&bytes, false);
         let mut lines = text.lines();
         if !matches!(
             lines.next().map(str::trim),
@@ -213,6 +268,40 @@ impl MptPreview {
     }
 }
 
+fn read_preview(path: &Path) -> io::Result<(Vec<u8>, bool)> {
+    require_regular_file(fs::metadata(path)?)?;
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // A path can be replaced by a FIFO between metadata() and open().
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    require_regular_file(file.metadata()?)?;
+
+    let mut bytes = Vec::new();
+    file.take((PREVIEW_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > PREVIEW_BYTES;
+    bytes.truncate(PREVIEW_BYTES);
+    Ok((bytes, truncated))
+}
+
+fn decode_preview(bytes: &[u8], truncated: bool) -> Cow<'_, str> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    match str::from_utf8(bytes) {
+        Ok(text) => Cow::Borrowed(text),
+        Err(error) if truncated && error.error_len().is_none() => {
+            let valid = &bytes[..error.valid_up_to()];
+            Cow::Borrowed(str::from_utf8(valid).expect("valid UTF-8 prefix"))
+        }
+        Err(_) => Cow::Owned(bytes.iter().copied().map(char::from).collect::<String>()),
+    }
+}
+
 fn fit_cell(value: &str, width: u16) -> Cell<'_> {
     let span = Span::raw(value);
     if span.width() <= usize::from(width) {
@@ -239,7 +328,7 @@ fn require_regular_file(metadata: fs::Metadata) -> io::Result<()> {
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "MPT preview requires a regular file",
+            "Preview requires a regular file",
         ))
     }
 }
@@ -320,6 +409,20 @@ mod tests {
         let preview = MptPreview::load(file.path()).unwrap();
         assert_eq!(preview.rows(), 1);
         assert!(preview.has_more_rows);
+    }
+
+    #[test]
+    fn text_keeps_a_partial_long_line_without_corrupting_its_utf8_prefix() {
+        let mut content = "heading\nµ".as_bytes().to_vec();
+        content.resize(PREVIEW_BYTES - 1, b'a');
+        content.extend_from_slice("測".as_bytes());
+        let file = preview_file(&content);
+        let preview = TextPreview::load(file.path()).unwrap();
+
+        assert!(preview.truncated);
+        assert_eq!(preview.rows(), 2);
+        assert!(preview.lines[1].starts_with("µ"));
+        assert!(preview.lines[1].ends_with('a'));
     }
 
     #[test]

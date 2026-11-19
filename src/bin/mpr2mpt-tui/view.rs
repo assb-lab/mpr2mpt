@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 use super::browser::{Entry, Kind, terminal_text};
 use super::footer;
 use super::jobs::{PendingOverwrite, Report};
-use super::{App, Detail, PromptKind, safe_text};
+use super::{App, Detail, PreviewFocus, PromptKind, safe_text};
 
 const ACCENT: Color = Color::Cyan;
 
@@ -48,7 +48,8 @@ impl App {
             heading,
         );
         if self.pending_overwrite.is_some()
-            || (!self.show_report && matches!(self.detail, Detail::Inspection(_)))
+            || self.preview_focus == Some(PreviewFocus::Expanded)
+            || (self.preview_focus.is_some() && panes.width < 64)
         {
             self.draw_details(frame, panes);
         } else {
@@ -155,11 +156,18 @@ impl App {
                 } else {
                     name
                 };
-                let block = panel(title);
+                let block = if self.preview_focus.is_some() {
+                    panel(title).border_style(ACCENT)
+                } else {
+                    panel(title)
+                };
                 let inner = block.inner(area);
                 frame.render_widget(block, area);
                 match detail {
                     Detail::Mpt(preview) => {
+                        preview.draw(frame, inner, self.preview_column, self.preview_row)
+                    }
+                    Detail::Text(preview) => {
                         preview.draw(frame, inner, self.preview_column, self.preview_row)
                     }
                     Detail::Inspection(preview) => {

@@ -29,7 +29,7 @@ use jobs::{BatchMessage, PendingOverwrite, Report, RunningBatch};
 use mpr2mpt::batch::BatchJob;
 use mpr2mpt::overwrite::OverwriteApproval;
 use path_field::PathField;
-use preview::{InspectionView, MptPreview};
+use preview::{InspectionView, MptPreview, TextPreview};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -140,8 +140,15 @@ enum Detail {
     Mpr { path: PathBuf, bytes: u64 },
     Inspection(InspectionView),
     Mpt(MptPreview),
+    Text(TextPreview),
     Folder(Vec<Entry>),
     Error(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewFocus {
+    Pane,
+    Expanded,
 }
 
 enum PromptKind {
@@ -169,6 +176,7 @@ struct App {
     browser: Browser,
     marked: BTreeSet<PathBuf>,
     detail: Detail,
+    preview_focus: Option<PreviewFocus>,
     preview_column: usize,
     preview_row: usize,
     output: Option<PathBuf>,
@@ -192,6 +200,7 @@ impl App {
             browser: Browser::open(args.input.as_deref().unwrap_or_else(|| Path::new(".")))?,
             marked: BTreeSet::new(),
             detail: Detail::Empty,
+            preview_focus: None,
             preview_column: 0,
             preview_row: 0,
             output: args.output.map(std::path::absolute).transpose()?,
@@ -238,16 +247,20 @@ impl App {
             return false;
         }
         match key.code {
-            KeyCode::Esc if !self.show_report && matches!(self.detail, Detail::Inspection(_)) => {
-                self.update_detail()
-            }
+            KeyCode::Esc if self.preview_focus.is_some() => self.leave_preview(),
             KeyCode::Esc if !self.browser.filter.is_empty() => self.set_filter(String::new()),
             KeyCode::Esc | KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('Q') => {
                 self.exit_directory = Some(self.browser.directory.clone());
                 return self.quit();
             }
-            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.parent(),
+            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
+                if self.preview_focus.is_some() {
+                    self.leave_preview();
+                } else {
+                    self.parent();
+                }
+            }
             KeyCode::Right | KeyCode::Char('l') => self.open_selection(false),
             KeyCode::Enter if key.kind == KeyEventKind::Press && self.show_report => {
                 self.open_result();
@@ -255,6 +268,8 @@ impl App {
             KeyCode::Enter if key.kind == KeyEventKind::Press => self.open_selection(true),
             KeyCode::Down | KeyCode::Char('j') => self.walk(1),
             KeyCode::Up | KeyCode::Char('k') => self.walk(-1),
+            KeyCode::Char('J') => self.move_metadata(1),
+            KeyCode::Char('K') => self.move_metadata(-1),
             KeyCode::Home => self.walk(isize::MIN),
             KeyCode::End | KeyCode::Char('G') => self.walk(isize::MAX),
             KeyCode::Char(' ') if key.kind == KeyEventKind::Press => self.toggle_mark(),
@@ -289,7 +304,10 @@ impl App {
             KeyCode::Char('d') if key.kind == KeyEventKind::Press => self.request_trash(),
             KeyCode::Char('o') => self.open_prompt(PromptKind::Output),
             KeyCode::Char('r') => self.reload(),
-            KeyCode::Tab if self.report.is_some() => self.show_report = !self.show_report,
+            KeyCode::Tab if self.report.is_some() => {
+                self.leave_preview();
+                self.show_report = !self.show_report;
+            }
             KeyCode::PageUp => self.move_details(-1, 0),
             KeyCode::PageDown => self.move_details(1, 0),
             KeyCode::Char('[') => self.move_details(0, -1),
@@ -305,11 +323,8 @@ impl App {
     }
 
     fn walk(&mut self, distance: isize) {
-        if !self.show_report
-            && let Detail::Inspection(preview) = &mut self.detail
-        {
-            preview.metadata_start =
-                shift(preview.metadata_start, distance, preview.metadata.len());
+        if self.preview_focus.is_some() {
+            self.move_details(distance, 0);
             return;
         }
         self.show_report = false;
@@ -451,6 +466,15 @@ impl App {
         match self.browser.selected() {
             Some(entry) if entry.kind == Kind::Directory => self.open_path(entry.path.clone()),
             Some(entry) if convert_mpr && entry.kind == Kind::Mpr => self.start_conversion(),
+            Some(entry)
+                if !convert_mpr && self.preview_focus.is_none() && entry.kind == Kind::Mpr =>
+            {
+                self.open_inspection(PreviewFocus::Pane);
+            }
+            Some(_) if !convert_mpr && matches!(self.detail, Detail::Mpt(_) | Detail::Text(_)) => {
+                self.preview_focus = Some(PreviewFocus::Pane);
+                self.show_report = false;
+            }
             Some(entry) if entry.kind == Kind::Mpt => self.show_report = false,
             _ => {}
         }
@@ -485,13 +509,30 @@ impl App {
     }
 
     fn reload(&mut self) {
-        match self.browser.reload() {
-            Ok(()) => self.update_detail(),
-            Err(error) => self.show_error(error),
+        let focused_path = self
+            .preview_focus
+            .and_then(|_| self.browser.selected())
+            .map(|entry| entry.path.clone());
+        let (row, column) = (self.preview_row, self.preview_column);
+        if let Err(error) = self.browser.reload() {
+            self.show_error(error);
+            return;
+        }
+        self.update_detail();
+        if let Some(path) = focused_path
+            && self
+                .browser
+                .selected()
+                .is_some_and(|entry| entry.path == path)
+            && matches!(self.detail, Detail::Mpt(_) | Detail::Text(_))
+        {
+            self.preview_focus = Some(PreviewFocus::Pane);
+            self.move_details(row as isize, column as isize);
         }
     }
 
     fn update_detail(&mut self) {
+        self.preview_focus = None;
         self.preview_column = 0;
         self.preview_row = 0;
         self.detail = match self.browser.selected() {
@@ -515,6 +556,14 @@ impl App {
                     Ok(preview) => Detail::Mpt(preview),
                     Err(error) => Detail::Error(error.to_string()),
                 },
+                Kind::Mps | Kind::Other
+                    if browser::is_text_preview(&entry.path) || entry.kind == Kind::Mps =>
+                {
+                    match TextPreview::load(&entry.path) {
+                        Ok(preview) => Detail::Text(preview),
+                        Err(error) => Detail::Error(error.to_string()),
+                    }
+                }
                 Kind::Mps | Kind::Other => Detail::Empty,
             },
             None => Detail::Empty,
@@ -694,6 +743,7 @@ impl App {
         let inputs = jobs.iter().map(|job| job.input.clone()).collect();
         match RunningBatch::start(jobs, approvals) {
             Ok(worker) => {
+                self.leave_preview();
                 self.report = Some(Report::new(inputs));
                 self.running = Some(worker);
                 self.show_report = true;
@@ -703,12 +753,18 @@ impl App {
     }
 
     fn toggle_inspection(&mut self) {
+        if self.preview_focus == Some(PreviewFocus::Expanded) {
+            self.leave_preview();
+        } else if matches!(self.detail, Detail::Inspection(_)) {
+            self.preview_focus = Some(PreviewFocus::Expanded);
+        } else {
+            self.open_inspection(PreviewFocus::Expanded);
+        }
+    }
+
+    fn open_inspection(&mut self, focus: PreviewFocus) {
         if self.running.is_some() {
             self.message = Some("Wait for the active conversion before opening a preview.".into());
-            return;
-        }
-        if !self.show_report && matches!(self.detail, Detail::Inspection(_)) {
-            self.update_detail();
             return;
         }
         let Some(entry) = self
@@ -722,11 +778,25 @@ impl App {
         match mpr2mpt::inspect(&entry.path) {
             Ok(inspection) => {
                 self.detail = Detail::Inspection(InspectionView::from(inspection));
+                self.preview_focus = Some(focus);
                 self.show_report = false;
                 self.preview_column = 0;
                 self.preview_row = 0;
             }
             Err(error) => self.show_error(error),
+        }
+    }
+
+    fn leave_preview(&mut self) {
+        if self.preview_focus.take().is_some() && matches!(self.detail, Detail::Inspection(_)) {
+            self.update_detail();
+        }
+    }
+
+    fn move_metadata(&mut self, distance: isize) {
+        if let Detail::Inspection(preview) = &mut self.detail {
+            preview.metadata_start =
+                shift(preview.metadata_start, distance, preview.metadata.len());
         }
     }
 
@@ -771,13 +841,14 @@ impl App {
                 report.cursor = shift(report.cursor, rows, report.inputs.len());
             }
         } else {
-            let table = match &self.detail {
-                Detail::Mpt(preview) => preview,
-                Detail::Inspection(preview) => &preview.table,
+            let (row_count, column_count) = match &self.detail {
+                Detail::Mpt(preview) => (preview.rows(), preview.columns()),
+                Detail::Inspection(preview) => (preview.table.rows(), preview.table.columns()),
+                Detail::Text(preview) => (preview.rows(), preview.columns()),
                 _ => return,
             };
-            self.preview_row = shift(self.preview_row, rows, table.rows());
-            self.preview_column = shift(self.preview_column, columns, table.columns());
+            self.preview_row = shift(self.preview_row, rows, row_count);
+            self.preview_column = shift(self.preview_column, columns, column_count);
         }
     }
 
@@ -883,6 +954,59 @@ mod navigation_tests {
         app.key(key('g'));
         assert!(!app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(app.prefix.is_none());
+    }
+
+    #[test]
+    fn right_focuses_preview_and_left_returns_to_the_same_file() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("selected.mpt");
+        fs::create_dir(scratch.path().join("folder")).unwrap();
+        fs::write(
+            &path,
+            b"EC-Lab ASCII FILE\nNb header lines : 3\ntime/s\n1\n2\n3\n",
+        )
+        .unwrap();
+        let mut app = app_at(&path);
+        let selected = app.browser.selected().unwrap().path.clone();
+
+        app.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.key(key('j'));
+        assert_eq!(app.preview_row, 1);
+        fs::write(scratch.path().join("another.mpt"), []).unwrap();
+        app.reload();
+        assert_eq!(app.preview_row, 1);
+        app.key(key('G'));
+        assert_eq!(app.preview_row, 2);
+        app.key(key('k'));
+        assert_eq!(app.preview_row, 1);
+        app.key(key('g'));
+        app.key(key('g'));
+        assert_eq!(app.preview_row, 0);
+        assert_eq!(app.browser.selected().unwrap().path, selected);
+
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.browser.selected().unwrap().path, selected);
+        app.key(key('g'));
+        app.key(key('g'));
+        assert_eq!(app.browser.selected().unwrap().kind, Kind::Directory);
+    }
+
+    #[test]
+    fn previews_named_text_inputs_including_mps_without_treating_them_as_mpr() {
+        let scratch = tempfile::tempdir().unwrap();
+        for suffix in ["mps", "TXT", "md", "csv", "tsv"] {
+            let path = scratch.path().join("sample").with_extension(suffix);
+            fs::write(&path, b"first line\nsecond line\n").unwrap();
+            let mut app = app_at(&path);
+            assert_eq!(
+                app.browser.selected().unwrap().label,
+                format!("sample.{suffix}")
+            );
+            assert_ne!(app.browser.selected().unwrap().kind, Kind::Mpr);
+            app.key(key('l'));
+            app.key(key('G'));
+            assert_eq!(app.preview_row, 1);
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ const INK: Color = Color::Rgb(16, 32, 51);
 
 const NORMAL: &[(&str, &str)] = &[
     ("j/k", "Move"),
-    ("h/l", "Folder"),
+    ("h/l", "Back/Open"),
     ("c", "Convert"),
     ("v", "Preview"),
     ("q/Q", "Quit/cd"),
@@ -56,12 +56,20 @@ pub(super) fn shortcuts(app: &App, width: u16) -> Vec<Line<'static>> {
         &[("y", "Copy"), ("Esc", "Cancel")]
     } else if app.prompt.is_some() {
         &[("Enter", "Apply"), ("Esc", "Back"), ("Ctrl+U", "Clear")]
-    } else if !app.show_report && matches!(app.detail, Detail::Inspection(_)) {
+    } else if app.preview_focus.is_some() && matches!(app.detail, Detail::Inspection(_)) {
         &[
+            ("h / Esc", "Files"),
+            ("j/k", "Rows"),
+            ("gg/G", "Top/End"),
+            ("J/K", "Metadata"),
+            ("[ ]", "Cols"),
             ("c", "Convert"),
-            ("v / Esc", "Back"),
-            ("j/k", "Metadata"),
-            ("PgUp/Dn", "Rows"),
+        ]
+    } else if app.preview_focus.is_some() {
+        &[
+            ("h / Esc", "Files"),
+            ("j/k", "Rows"),
+            ("gg/G", "Top/End"),
             ("[ ]", "Cols"),
         ]
     } else {

@@ -58,7 +58,13 @@ impl Browser {
             label: terminal_text(Path::new(name)),
             kind: kind
                 .or_else(|| measurement_kind(&absolute))
-                .unwrap_or(Kind::Mpr),
+                .unwrap_or_else(|| {
+                    if is_text_preview(&absolute) {
+                        Kind::Other
+                    } else {
+                        Kind::Mpr
+                    }
+                }),
         });
         let mut all_files = entries(&directory, false, true)?;
         if let Some(entry) = &explicit {
@@ -135,12 +141,13 @@ impl Browser {
 
     fn update_files(&mut self, fallback: usize) {
         let before = self.selected().map(|entry| entry.path.clone());
+        let explicit = self.explicit.as_ref().map(|entry| &entry.path);
         let query = self.filter.to_lowercase();
         self.files = self
             .all_files
             .iter()
             .filter(|entry| {
-                (!self.restricted || entry.kind != Kind::Other)
+                (!self.restricted || entry.kind != Kind::Other || explicit == Some(&entry.path))
                     && (self.show_hidden || !is_hidden(&entry.path))
                     && (query.is_empty() || entry.label.to_lowercase().contains(&query))
             })
@@ -188,6 +195,14 @@ fn measurement_kind(path: &Path) -> Option<Kind> {
     } else {
         None
     }
+}
+
+pub(super) fn is_text_preview(path: &Path) -> bool {
+    path.extension().is_some_and(|suffix| {
+        ["txt", "md", "markdown", "csv", "tsv"]
+            .iter()
+            .any(|extension| suffix.eq_ignore_ascii_case(extension))
+    })
 }
 
 pub(super) fn terminal_text(path: &Path) -> String {
