@@ -4,7 +4,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::App;
+use super::{App, Detail, Prefix};
 
 const BAR: Color = Color::Rgb(37, 53, 73);
 const GUIDE: Color = Color::Rgb(23, 33, 49);
@@ -17,9 +17,11 @@ const NORMAL: &[(&str, &str)] = &[
     ("j/k", "Move"),
     ("h/l", "Folder"),
     ("c", "Convert"),
-    ("q", "Quit"),
+    ("v", "Preview"),
+    ("q/Q", "Quit/cd"),
     ("g…", "Jump"),
-    ("p", "Path"),
+    ("yy/p", "Copy/Paste"),
+    (".", "Hidden"),
     ("f", "Filter"),
     ("m", "Mode"),
     ("d", "Trash"),
@@ -33,17 +35,35 @@ const NORMAL: &[(&str, &str)] = &[
 ];
 
 pub(super) fn shortcuts(app: &App, width: u16) -> Vec<Line<'static>> {
-    let keys: &[(&str, &str)] = if app.trash_target.is_some() {
-        &[("y", "Confirm"), ("n / Esc", "Cancel")]
-    } else if app.pending_jump {
+    let keys: &[(&str, &str)] = if app.pending_overwrite.is_some() {
         &[
+            ("y", "Overwrite"),
+            ("s", "No overwrite"),
+            ("Esc", "Cancel"),
+            ("j/k", "Outputs"),
+        ]
+    } else if app.trash_target.is_some() {
+        &[("y", "Confirm"), ("n / Esc", "Cancel")]
+    } else if app.prefix == Some(Prefix::Jump) {
+        &[
+            ("Space", "Path"),
             ("g", "Top"),
             ("d", "Downloads"),
             ("h", "Home"),
             ("t", "Trash"),
         ]
+    } else if app.prefix == Some(Prefix::Copy) {
+        &[("y", "Copy"), ("Esc", "Cancel")]
     } else if app.prompt.is_some() {
         &[("Enter", "Apply"), ("Esc", "Back"), ("Ctrl+U", "Clear")]
+    } else if !app.show_report && matches!(app.detail, Detail::Inspection(_)) {
+        &[
+            ("c", "Convert"),
+            ("v / Esc", "Back"),
+            ("j/k", "Metadata"),
+            ("PgUp/Dn", "Rows"),
+            ("[ ]", "Cols"),
+        ]
     } else {
         NORMAL
     };
@@ -173,7 +193,7 @@ mod tests {
         for width in [51, 111] {
             let lines = key_lines(NORMAL, width);
             assert!(lines.iter().all(|line| line.width() <= usize::from(width)));
-            assert!(lines.len() <= 4);
+            assert!(lines.len() <= 5);
         }
         let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
         terminal

@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 
 use super::browser::{Entry, Kind, terminal_text};
 use super::footer;
-use super::jobs::Report;
+use super::jobs::{PendingOverwrite, Report};
 use super::{App, Detail, PromptKind, safe_text};
 
 const ACCENT: Color = Color::Cyan;
@@ -47,6 +47,38 @@ impl App {
             ]),
             heading,
         );
+        if self.pending_overwrite.is_some()
+            || (!self.show_report && matches!(self.detail, Detail::Inspection(_)))
+        {
+            self.draw_details(frame, panes);
+        } else {
+            self.draw_browser(frame, panes);
+        }
+        footer::draw_status(self, frame, status);
+        if let Some(edit) = &self.prompt {
+            let (title, placeholder) = match &edit.kind {
+                PromptKind::Path => ("Go to path", "Folder or measurement file"),
+                PromptKind::Output => ("Single-file output", "Empty uses the source folder"),
+                PromptKind::Filter { .. } => ("Filter files", "Filter by name"),
+            };
+            edit.field.draw(frame, prompt, title, placeholder, true);
+        }
+        if let Some(target) = &self.trash_target {
+            let path = &target.path;
+            let block = panel("Move to Trash?").border_style(Color::Yellow);
+            let inner = block.inner(prompt);
+            frame.render_widget(block, prompt);
+            let name = path.file_name().map_or(path.as_path(), Path::new);
+            let lines = vec![
+                Line::from(terminal_text(name)).bold(),
+                Line::from(terminal_text(path.parent().unwrap_or(path))),
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        footer::draw_shortcuts(frame, help, hints);
+    }
+
+    fn draw_browser(&self, frame: &mut Frame, panes: Rect) {
         let (files, details) = if panes.width >= 96 {
             let [parent, files, details] = Layout::horizontal([
                 Constraint::Percentage(23),
@@ -94,31 +126,13 @@ impl App {
             self.plain_icons,
         );
         self.draw_details(frame, details);
-        footer::draw_status(self, frame, status);
-        if let Some(edit) = &self.prompt {
-            let (title, placeholder) = match &edit.kind {
-                PromptKind::Path => ("Go to path", "Folder or measurement file"),
-                PromptKind::Output => ("Single-file output", "Empty uses the source folder"),
-                PromptKind::Filter { .. } => ("Filter files", "Filter by name"),
-            };
-            edit.field.draw(frame, prompt, title, placeholder, true);
-        }
-        if let Some(target) = &self.trash_target {
-            let path = &target.path;
-            let block = panel("Move to Trash?").border_style(Color::Yellow);
-            let inner = block.inner(prompt);
-            frame.render_widget(block, prompt);
-            let name = path.file_name().map_or(path.as_path(), Path::new);
-            let lines = vec![
-                Line::from(terminal_text(name)).bold(),
-                Line::from(terminal_text(path.parent().unwrap_or(path))),
-            ];
-            frame.render_widget(Paragraph::new(lines), inner);
-        }
-        footer::draw_shortcuts(frame, help, hints);
     }
 
     fn draw_details(&self, frame: &mut Frame, area: Rect) {
+        if let Some(pending) = &self.pending_overwrite {
+            pending.draw(frame, area);
+            return;
+        }
         if self.show_report
             && let Some(report) = &self.report
         {
@@ -134,12 +148,51 @@ impl App {
                 draw_entries(frame, area, name, entries, None, None, self.plain_icons)
             }
             detail => {
-                let block = panel(name);
+                let preview_title;
+                let title = if matches!(detail, Detail::Inspection(_)) {
+                    preview_title = format!("MPR preview · {name}");
+                    preview_title.as_str()
+                } else {
+                    name
+                };
+                let block = panel(title);
                 let inner = block.inner(area);
                 frame.render_widget(block, area);
                 match detail {
                     Detail::Mpt(preview) => {
                         preview.draw(frame, inner, self.preview_column, self.preview_row)
+                    }
+                    Detail::Inspection(preview) => {
+                        let [metadata, samples] = if inner.width >= 76 {
+                            Layout::horizontal([
+                                Constraint::Percentage(32),
+                                Constraint::Percentage(68),
+                            ])
+                            .areas(inner)
+                        } else {
+                            let height = (preview.metadata.len() as u16 + 1).min(inner.height / 2);
+                            Layout::vertical([Constraint::Length(height), Constraint::Min(1)])
+                                .areas(inner)
+                        };
+                        let details: Vec<_> = preview
+                            .metadata
+                            .iter()
+                            .skip(preview.metadata_start)
+                            .map(|(key, value)| {
+                                Line::from(vec![
+                                    Span::raw(key).fg(ACCENT),
+                                    Span::raw("  "),
+                                    Span::raw(value),
+                                ])
+                            })
+                            .collect();
+                        frame.render_widget(
+                            Paragraph::new(details).wrap(Wrap { trim: false }),
+                            metadata,
+                        );
+                        preview
+                            .table
+                            .draw(frame, samples, self.preview_column, self.preview_row);
                     }
                     Detail::Mpr { path, bytes } => {
                         let size = format!("{:.1} KiB", *bytes as f64 / 1024.0);
@@ -266,6 +319,62 @@ fn file_style(kind: Kind, path: &Path) -> (&'static str, &'static str, Color) {
         _ => ("\u{f15b}", "·"),
     };
     (icon, plain, Color::Reset)
+}
+
+impl PendingOverwrite {
+    fn draw(&self, frame: &mut Frame, area: Rect) {
+        let block = panel("Overwrite output?").border_style(Color::Yellow);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let [intro, list, detail] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(3.min(inner.height / 3)),
+        ])
+        .areas(inner);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} output destinations need attention",
+                self.existing.len()
+            ))
+            .yellow(),
+            intro,
+        );
+        let slots = usize::from(list.height);
+        let start = visible_start(self.cursor, slots, self.existing.len());
+        let items = self
+            .existing
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(slots)
+            .map(|(index, row)| {
+                let name =
+                    terminal_text(row.path.file_name().map_or(row.path.as_path(), Path::new));
+                let status = if row.approval.is_ok() {
+                    "Existing"
+                } else {
+                    "Blocked"
+                };
+                let item = ListItem::new(Line::from(vec![
+                    Span::raw(format!("{status}  ")).yellow(),
+                    Span::raw(name),
+                ]));
+                if index == self.cursor {
+                    item.style(Style::new().bg(Color::Rgb(60, 55, 39)))
+                } else {
+                    item
+                }
+            });
+        frame.render_widget(List::new(items), list);
+        if let Some(row) = self.existing.get(self.cursor) {
+            let mut lines = vec![Line::from(terminal_text(&row.path))];
+            if let Err(error) = &row.approval {
+                lines.push(Line::from(safe_text(&error.to_string())).red());
+            }
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
+        }
+    }
 }
 
 impl Report {

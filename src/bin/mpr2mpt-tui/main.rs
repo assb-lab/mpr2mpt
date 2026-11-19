@@ -1,4 +1,5 @@
 mod browser;
+mod clipboard;
 mod footer;
 mod jobs;
 mod path_field;
@@ -6,8 +7,8 @@ mod preview;
 mod trash;
 mod view;
 
-use std::collections::BTreeSet;
-use std::io::{self, IsTerminal};
+use std::collections::{BTreeSet, HashMap};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::TryRecvError;
@@ -24,10 +25,11 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use jobs::{BatchMessage, Report, RunningBatch};
+use jobs::{BatchMessage, PendingOverwrite, Report, RunningBatch};
 use mpr2mpt::batch::BatchJob;
+use mpr2mpt::overwrite::OverwriteApproval;
 use path_field::PathField;
-use preview::MptPreview;
+use preview::{InspectionView, MptPreview};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -46,6 +48,9 @@ struct Args {
     /// Use standard text symbols instead of Nerd Font icons
     #[arg(long)]
     plain_icons: bool,
+    /// Create a NUL-terminated directory file on Shift+Q for shell integration
+    #[arg(long, value_name = "PATH")]
+    cwd_file: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -64,7 +69,32 @@ fn run(args: Args) -> io::Result<()> {
             "mpr2mpt-tui needs an interactive terminal",
         ));
     }
+    let cwd_file = args.cwd_file.clone();
     let mut app = App::new(args)?;
+    run_terminal(&mut app)?;
+    if let Some(directory) = app.exit_directory {
+        if let Some(destination) = cwd_file {
+            write_exit_directory(&destination, &directory)?;
+        } else {
+            println!("{}", browser::terminal_text(&directory));
+        }
+    }
+    Ok(())
+}
+
+fn write_exit_directory(destination: &Path, directory: &Path) -> io::Result<()> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut answer = tempfile::NamedTempFile::new_in(parent)?;
+    answer.write_all(directory.as_os_str().as_encoded_bytes())?;
+    answer.write_all(b"\0")?;
+    answer.persist_noclobber(destination)?;
+    Ok(())
+}
+
+fn run_terminal(app: &mut App) -> io::Result<()> {
     enable_raw_mode()?;
     let _session = TerminalSession;
     let mut stdout = io::stdout();
@@ -108,6 +138,7 @@ impl Drop for TerminalSession {
 enum Detail {
     Empty,
     Mpr { path: PathBuf, bytes: u64 },
+    Inspection(InspectionView),
     Mpt(MptPreview),
     Folder(Vec<Entry>),
     Error(String),
@@ -127,6 +158,12 @@ struct Prompt {
     field: PathField,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prefix {
+    Jump,
+    Copy,
+}
+
 struct App {
     plain_icons: bool,
     browser: Browser,
@@ -137,11 +174,14 @@ struct App {
     output: Option<PathBuf>,
     prompt: Option<Prompt>,
     trash_target: Option<trash::Target>,
-    pending_jump: bool,
+    prefix: Option<Prefix>,
+    clipboard: Vec<PathBuf>,
+    pending_overwrite: Option<PendingOverwrite>,
     report: Option<Report>,
     show_report: bool,
     running: Option<RunningBatch>,
     exit_when_done: bool,
+    exit_directory: Option<PathBuf>,
     message: Option<String>,
 }
 
@@ -157,11 +197,14 @@ impl App {
             output: args.output.map(std::path::absolute).transpose()?,
             prompt: None,
             trash_target: None,
-            pending_jump: false,
+            prefix: None,
+            clipboard: Vec::new(),
+            pending_overwrite: None,
             report: None,
             show_report: false,
             running: None,
             exit_when_done: false,
+            exit_directory: None,
             message: None,
         };
         app.update_detail();
@@ -180,18 +223,30 @@ impl App {
             self.confirm_trash(key);
             return false;
         }
+        if self.pending_overwrite.is_some() {
+            self.confirm_overwrite(key);
+            return false;
+        }
 
         self.message = None;
-        let pending = std::mem::take(&mut self.pending_jump);
-        if pending
-            && key.kind == KeyEventKind::Press
-            && (key.code == KeyCode::Esc || self.jump(key.code))
+        if self.prefix.is_some() && key.kind == KeyEventKind::Repeat {
+            return false;
+        }
+        if let Some(prefix) = self.prefix.take()
+            && self.complete_prefix(prefix, key)
         {
             return false;
         }
         match key.code {
+            KeyCode::Esc if !self.show_report && matches!(self.detail, Detail::Inspection(_)) => {
+                self.update_detail()
+            }
             KeyCode::Esc if !self.browser.filter.is_empty() => self.set_filter(String::new()),
             KeyCode::Esc | KeyCode::Char('q') => return self.quit(),
+            KeyCode::Char('Q') => {
+                self.exit_directory = Some(self.browser.directory.clone());
+                return self.quit();
+            }
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.parent(),
             KeyCode::Right | KeyCode::Char('l') => self.open_selection(false),
             KeyCode::Enter if key.kind == KeyEventKind::Press && self.show_report => {
@@ -205,9 +260,19 @@ impl App {
             KeyCode::Char(' ') if key.kind == KeyEventKind::Press => self.toggle_mark(),
             KeyCode::Char('x') => self.marked.clear(),
             KeyCode::Char('c') if key.kind == KeyEventKind::Press => self.start_conversion(),
-            KeyCode::Char('g') if key.kind == KeyEventKind::Press => self.pending_jump = true,
-            KeyCode::Char('p') if key.kind == KeyEventKind::Press => {
-                self.open_prompt(PromptKind::Path)
+            KeyCode::Char('v') if key.kind == KeyEventKind::Press => self.toggle_inspection(),
+            KeyCode::Char('g') if key.kind == KeyEventKind::Press => {
+                self.prefix = Some(Prefix::Jump)
+            }
+            KeyCode::Char('y') if key.kind == KeyEventKind::Press => {
+                self.prefix = Some(Prefix::Copy)
+            }
+            KeyCode::Char('p') if key.kind == KeyEventKind::Press => self.paste_files(),
+            KeyCode::Char('.') if key.kind == KeyEventKind::Press => {
+                self.browser
+                    .set_visibility(self.browser.restricted, !self.browser.show_hidden);
+                self.show_report = false;
+                self.update_detail();
             }
             KeyCode::Char('f') if key.kind == KeyEventKind::Press => {
                 self.open_prompt(PromptKind::Filter {
@@ -216,7 +281,8 @@ impl App {
                 })
             }
             KeyCode::Char('m') if key.kind == KeyEventKind::Press => {
-                self.browser.set_mode(!self.browser.restricted);
+                self.browser
+                    .set_visibility(!self.browser.restricted, self.browser.show_hidden);
                 self.show_report = false;
                 self.update_detail();
             }
@@ -239,15 +305,43 @@ impl App {
     }
 
     fn walk(&mut self, distance: isize) {
+        if !self.show_report
+            && let Detail::Inspection(preview) = &mut self.detail
+        {
+            preview.metadata_start =
+                shift(preview.metadata_start, distance, preview.metadata.len());
+            return;
+        }
         self.show_report = false;
         self.browser.walk(distance);
         self.update_detail();
+    }
+
+    fn complete_prefix(&mut self, prefix: Prefix, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Esc {
+            return true;
+        }
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+        match prefix {
+            Prefix::Jump => self.jump(key.code),
+            Prefix::Copy if key.code == KeyCode::Char('y') => {
+                self.yank();
+                true
+            }
+            Prefix::Copy => false,
+        }
     }
 
     fn jump(&mut self, key: KeyCode) -> bool {
         let path = match key {
             KeyCode::Char('g') => {
                 self.walk(isize::MIN);
+                return true;
+            }
+            KeyCode::Char(' ') => {
+                self.open_prompt(PromptKind::Path);
                 return true;
             }
             KeyCode::Char('d') => trash::home().map(|path| path.join("Downloads")),
@@ -260,6 +354,54 @@ impl App {
             Err(error) => self.show_error(error),
         }
         true
+    }
+
+    fn yank(&mut self) {
+        let sources: Vec<_> = if self.marked.is_empty() {
+            self.browser
+                .selected()
+                .map(|entry| entry.path.clone())
+                .into_iter()
+                .collect()
+        } else {
+            self.marked.iter().cloned().collect()
+        };
+        if sources.is_empty() {
+            self.message = Some("Select an item to copy.".into());
+            return;
+        }
+        self.message = Some(format!("{} item(s) ready to paste.", sources.len()));
+        self.clipboard = sources;
+    }
+
+    fn paste_files(&mut self) {
+        if self.clipboard.is_empty() {
+            self.message = Some("Use yy to copy an item first.".into());
+            return;
+        }
+        let mut copied = 0;
+        let mut first_failure = None;
+        for source in &self.clipboard {
+            match clipboard::copy_into(source, &self.browser.directory) {
+                Ok(_) => copied += 1,
+                Err(error) => {
+                    first_failure.get_or_insert_with(|| {
+                        format!(
+                            "{}: {}",
+                            browser::terminal_text(source),
+                            safe_text(&error.to_string())
+                        )
+                    });
+                }
+            }
+        }
+        let failed = self.clipboard.len() - copied;
+        self.message = Some(match first_failure {
+            Some(reason) => format!("{copied} pasted, {failed} failed. {reason}"),
+            None => format!("{copied} item(s) pasted."),
+        });
+        self.show_report = false;
+        self.reload();
     }
 
     fn request_trash(&mut self) {
@@ -315,7 +457,10 @@ impl App {
     }
 
     fn set_browser(&mut self, mut browser: Browser) {
-        browser.set_mode(self.browser.restricted);
+        browser.set_visibility(
+            self.browser.restricted,
+            self.browser.show_hidden || browser.show_hidden,
+        );
         self.browser = browser;
         self.show_report = false;
         self.update_detail();
@@ -351,7 +496,11 @@ impl App {
         self.preview_row = 0;
         self.detail = match self.browser.selected() {
             Some(entry) => match entry.kind {
-                Kind::Directory => match browser::entries(&entry.path, self.browser.restricted) {
+                Kind::Directory => match browser::entries(
+                    &entry.path,
+                    self.browser.restricted,
+                    self.browser.show_hidden,
+                ) {
                     Ok(entries) => Detail::Folder(entries),
                     Err(error) => Detail::Error(error.to_string()),
                 },
@@ -502,11 +651,79 @@ impl App {
                 output: self.output.clone(),
             })
             .collect();
-        match RunningBatch::start(jobs) {
+        let pending = PendingOverwrite::scan(jobs);
+        if pending.existing.is_empty() {
+            self.run_jobs(pending.jobs, HashMap::new());
+        } else {
+            self.pending_overwrite = Some(pending);
+        }
+    }
+
+    fn confirm_overwrite(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 's')
+                if key.kind == KeyEventKind::Press && key.modifiers.is_empty() =>
+            {
+                let Some(pending) = self.pending_overwrite.take() else {
+                    return;
+                };
+                let (jobs, approvals) = if key.code == KeyCode::Char('y') {
+                    pending.approvals()
+                } else {
+                    (pending.jobs, HashMap::new())
+                };
+                self.run_jobs(jobs, approvals);
+            }
+            KeyCode::Esc | KeyCode::Char('n') => self.pending_overwrite = None,
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k') => {
+                if let Some(pending) = &mut self.pending_overwrite {
+                    let distance = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
+                        -1
+                    } else {
+                        1
+                    };
+                    pending.cursor = shift(pending.cursor, distance, pending.existing.len());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn run_jobs(&mut self, jobs: Vec<BatchJob>, approvals: HashMap<usize, OverwriteApproval>) {
+        let inputs = jobs.iter().map(|job| job.input.clone()).collect();
+        match RunningBatch::start(jobs, approvals) {
             Ok(worker) => {
-                self.report = Some(Report::new(checked));
+                self.report = Some(Report::new(inputs));
                 self.running = Some(worker);
                 self.show_report = true;
+            }
+            Err(error) => self.show_error(error),
+        }
+    }
+
+    fn toggle_inspection(&mut self) {
+        if self.running.is_some() {
+            self.message = Some("Wait for the active conversion before opening a preview.".into());
+            return;
+        }
+        if !self.show_report && matches!(self.detail, Detail::Inspection(_)) {
+            self.update_detail();
+            return;
+        }
+        let Some(entry) = self
+            .browser
+            .selected()
+            .filter(|entry| entry.kind == Kind::Mpr)
+        else {
+            self.message = Some("Select an MPR to preview.".into());
+            return;
+        };
+        match mpr2mpt::inspect(&entry.path) {
+            Ok(inspection) => {
+                self.detail = Detail::Inspection(InspectionView::from(inspection));
+                self.show_report = false;
+                self.preview_column = 0;
+                self.preview_row = 0;
             }
             Err(error) => self.show_error(error),
         }
@@ -552,9 +769,14 @@ impl App {
             if let Some(report) = &mut self.report {
                 report.cursor = shift(report.cursor, rows, report.inputs.len());
             }
-        } else if let Detail::Mpt(preview) = &self.detail {
-            self.preview_row = shift(self.preview_row, rows, preview.rows());
-            self.preview_column = shift(self.preview_column, columns, preview.columns());
+        } else {
+            let table = match &self.detail {
+                Detail::Mpt(preview) => preview,
+                Detail::Inspection(preview) => &preview.table,
+                _ => return,
+            };
+            self.preview_row = shift(self.preview_row, rows, table.rows());
+            self.preview_column = shift(self.preview_column, columns, table.columns());
         }
     }
 
@@ -590,6 +812,7 @@ mod navigation_tests {
             input: Some(path.into()),
             output: None,
             plain_icons: false,
+            cwd_file: None,
         })
         .unwrap()
     }
@@ -626,7 +849,7 @@ mod navigation_tests {
         assert_eq!(app.browser.cursor, 0);
         app.key(key('g'));
         assert!(!app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        assert!(!app.pending_jump);
+        assert!(app.prefix.is_none());
     }
 
     #[test]
@@ -640,6 +863,70 @@ mod navigation_tests {
         assert_eq!(app.browser.files.len(), 2);
         app.key(key('m'));
         assert_eq!(app.browser.files.len(), 1);
+    }
+
+    #[test]
+    fn path_prompt_uses_g_then_space_without_marking() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("sample.mpr");
+        fs::write(&path, []).unwrap();
+        let mut app = app_at(scratch.path());
+        app.key(key('g'));
+        app.key(key(' '));
+        assert!(matches!(app.prompt.unwrap().kind, PromptKind::Path));
+        assert!(app.marked.is_empty());
+    }
+
+    #[test]
+    fn dotfiles_are_hidden_until_toggled_and_setting_survives_navigation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let child = scratch.path().join("folder");
+        fs::create_dir(&child).unwrap();
+        fs::write(scratch.path().join(".root.mpr"), []).unwrap();
+        fs::write(child.join(".child.mpr"), []).unwrap();
+        let mut app = app_at(scratch.path());
+        assert_eq!(app.browser.files.len(), 1);
+        assert!(matches!(&app.detail, Detail::Folder(entries) if entries.is_empty()));
+        app.key(key('.'));
+        assert_eq!(app.browser.files.len(), 2);
+        assert!(matches!(&app.detail, Detail::Folder(entries) if entries.len() == 1));
+        app.key(key('l'));
+        assert_eq!(app.browser.selected().unwrap().label, ".child.mpr");
+        app.key(key('.'));
+        assert!(app.browser.files.is_empty());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn yy_and_p_copy_across_folders_without_overwriting() {
+        let scratch = tempfile::tempdir().unwrap();
+        let child = scratch.path().join("folder");
+        fs::create_dir(&child).unwrap();
+        let source = scratch.path().join("sample.mpr");
+        let destination = child.join("sample.mpr");
+        fs::write(&source, b"source").unwrap();
+        let mut app = app_at(&source);
+        app.key(key('y'));
+        app.key(key('y'));
+        app.key(key('k'));
+        app.key(key('l'));
+        app.key(key('p'));
+        assert_eq!(fs::read(&destination).unwrap(), b"source");
+        fs::write(&destination, b"other").unwrap();
+        app.key(key('p'));
+        assert_eq!(fs::read(&destination).unwrap(), b"other");
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn shift_q_requests_the_current_directory_and_q_exits_normally() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = app_at(scratch.path());
+        assert!(app.key(key('q')));
+        assert!(app.exit_directory.is_none());
+        assert!(app.key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT)));
+        assert_eq!(app.exit_directory.unwrap(), app.browser.directory);
     }
 
     #[test]

@@ -9,7 +9,8 @@ use rayon::prelude::*;
 #[cfg(unix)]
 use rustix::fs::{Mode, OFlags, open, openat};
 
-use crate::{ConversionError, ConversionReport, convert};
+use crate::overwrite::OverwriteApproval;
+use crate::{ConversionError, ConversionReport, convert, convert_with_approval};
 
 const MAX_WORKERS: usize = 2;
 
@@ -18,6 +19,14 @@ const MAX_WORKERS: usize = 2;
 pub struct BatchJob {
     pub input: PathBuf,
     pub output: Option<PathBuf>,
+}
+
+impl BatchJob {
+    pub fn destination(&self) -> PathBuf {
+        self.output
+            .clone()
+            .unwrap_or_else(|| self.input.with_extension("mpt"))
+    }
 }
 
 /// A conversion result and its index in the original batch.
@@ -35,20 +44,39 @@ pub fn convert_batch(
     jobs: &[BatchJob],
     report: impl Fn(BatchOutcome) + Sync,
 ) -> Result<(), rayon::ThreadPoolBuildError> {
-    let outputs: Vec<_> = jobs
-        .iter()
-        .map(|job| {
-            job.output
-                .clone()
-                .unwrap_or_else(|| job.input.with_extension("mpt"))
-        })
-        .collect();
+    convert_batch_with_approvals(jobs, &HashMap::new(), report)
+}
+
+/// Execute a batch with explicit replacement approvals for particular job indices.
+pub fn convert_batch_with_approvals(
+    jobs: &[BatchJob],
+    approvals: &HashMap<usize, OverwriteApproval>,
+    report: impl Fn(BatchOutcome) + Sync,
+) -> Result<(), rayon::ThreadPoolBuildError> {
+    let outputs: Vec<_> = jobs.iter().map(BatchJob::destination).collect();
+    let protected: Vec<_> = if approvals.is_empty() {
+        Vec::new()
+    } else {
+        jobs.iter().map(|job| job.input.clone()).collect()
+    };
     let checks = check_destinations(&outputs);
     let run = |(index, check): (usize, DestinationCheck)| {
         let job = &jobs[index];
-        let result = check
-            .error
-            .map_or_else(|| convert(&job.input, job.output.as_deref()), Err);
+        let result = check.error.map_or_else(
+            || {
+                if let Some(approval) = approvals.get(&index) {
+                    convert_with_approval(
+                        &job.input,
+                        job.output.as_deref(),
+                        Some(approval),
+                        &protected,
+                    )
+                } else {
+                    convert(&job.input, job.output.as_deref())
+                }
+            },
+            Err,
+        );
         report(BatchOutcome { index, result });
     };
 

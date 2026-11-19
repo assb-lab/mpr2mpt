@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::mpsc;
 
 use mpr2mpt::ConversionError;
-use mpr2mpt::batch::{BatchJob, convert_batch};
+use mpr2mpt::batch::{BatchJob, convert_batch, convert_batch_with_approvals};
+use mpr2mpt::overwrite::OverwriteApproval;
 
 fn run(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_mpr2mpt"))
@@ -103,6 +105,60 @@ fn writes_to_explicit_output_and_refuses_existing_entries() {
     );
     assert_eq!(fs::read(dir.path().join("test.mpr")).unwrap(), mpr);
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+}
+
+#[test]
+fn batch_replaces_only_currently_approved_outputs_after_successful_conversion() {
+    let dir = tempfile::tempdir().unwrap();
+    let jobs: Vec<_> = ["approved", "unapproved", "corrupt", "changed", "fresh"]
+        .into_iter()
+        .map(|name| BatchJob {
+            input: dir.path().join(name).with_extension("mpr"),
+            output: None,
+        })
+        .collect();
+    for (index, job) in jobs.iter().enumerate() {
+        fs::write(&job.input, if index == 2 { vec![] } else { sample() }).unwrap();
+        if index != 4 {
+            fs::write(job.destination(), b"original").unwrap();
+        }
+    }
+    let approvals: HashMap<_, _> = [0, 2, 3]
+        .into_iter()
+        .map(|index| {
+            let approval = OverwriteApproval::capture(&jobs[index].destination())
+                .unwrap()
+                .unwrap();
+            (index, approval)
+        })
+        .collect();
+    fs::write(jobs[3].destination(), b"changed longer replacement").unwrap();
+
+    let (sender, receiver) = mpsc::channel();
+    convert_batch_with_approvals(&jobs, &approvals, |outcome| sender.send(outcome).unwrap())
+        .unwrap();
+    drop(sender);
+    let mut outcomes: Vec<_> = receiver.into_iter().collect();
+    outcomes.sort_by_key(|item| item.index);
+    assert_eq!(outcomes.len(), jobs.len());
+    assert!(outcomes[0].result.is_ok());
+    assert!(outcomes[1].result.is_err());
+    assert!(outcomes[2].result.is_err());
+    assert!(matches!(
+        outcomes[3].result,
+        Err(ConversionError::OverwriteChanged(_))
+    ));
+    assert!(outcomes[4].result.is_ok());
+    assert_eq!(fs::read(jobs[1].destination()).unwrap(), b"original");
+    assert_eq!(fs::read(jobs[2].destination()).unwrap(), b"original");
+    assert_eq!(
+        fs::read(jobs[3].destination()).unwrap(),
+        b"changed longer replacement"
+    );
+    assert_eq!(
+        fs::read(jobs[0].destination()).unwrap(),
+        fs::read(jobs[4].destination()).unwrap()
+    );
 }
 
 #[test]

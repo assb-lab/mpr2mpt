@@ -18,6 +18,30 @@ pub(super) struct MptPreview {
     has_more_rows: bool,
 }
 
+pub(super) struct InspectionView {
+    pub(super) metadata: Vec<(String, String)>,
+    pub(super) metadata_start: usize,
+    pub(super) table: MptPreview,
+}
+
+impl From<mpr2mpt::Inspection> for InspectionView {
+    fn from(inspection: mpr2mpt::Inspection) -> Self {
+        Self {
+            metadata_start: 0,
+            metadata: inspection
+                .metadata
+                .into_iter()
+                .map(|(name, value)| (cell_text(&name), cell_text(&value)))
+                .collect(),
+            table: MptPreview {
+                has_more_rows: inspection.total_rows > inspection.rows.len() as u64,
+                headings: inspection.headings,
+                data: inspection.rows,
+            },
+        }
+    }
+}
+
 impl MptPreview {
     pub(super) fn load(path: &Path) -> io::Result<Self> {
         require_regular_file(fs::metadata(path)?)?;

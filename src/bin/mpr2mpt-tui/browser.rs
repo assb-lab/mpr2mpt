@@ -23,6 +23,7 @@ pub(super) struct Browser {
     pub(super) parents: Vec<Entry>,
     pub(super) cursor: usize,
     pub(super) restricted: bool,
+    pub(super) show_hidden: bool,
     pub(super) filter: String,
     all_files: Vec<Entry>,
     explicit: Option<Entry>,
@@ -59,13 +60,16 @@ impl Browser {
                 .or_else(|| measurement_kind(&absolute))
                 .unwrap_or(Kind::Mpr),
         });
-        let mut all_files = entries(&directory, false)?;
+        let mut all_files = entries(&directory, false, true)?;
         if let Some(entry) = &explicit {
             keep_explicit(&mut all_files, entry);
         }
+        let show_hidden = explicit
+            .as_ref()
+            .is_some_and(|entry| is_hidden(&entry.path));
         let parents = directory
             .parent()
-            .and_then(|parent| entries(parent, true).ok())
+            .and_then(|parent| entries(parent, true, show_hidden).ok())
             .unwrap_or_default();
         let mut browser = Self {
             directory,
@@ -73,6 +77,7 @@ impl Browser {
             parents,
             cursor: 0,
             restricted: true,
+            show_hidden,
             filter: String::new(),
             all_files,
             explicit,
@@ -93,12 +98,13 @@ impl Browser {
             return Ok(None);
         };
         let mut browser = Self::open(parent)?;
+        browser.set_visibility(self.restricted, self.show_hidden);
         browser.focus_path(&self.directory);
         Ok(Some(browser))
     }
 
     pub(super) fn reload(&mut self) -> io::Result<()> {
-        let mut files = entries(&self.directory, false)?;
+        let mut files = entries(&self.directory, false, true)?;
         if let Some(entry) = &self.explicit
             && entry.path.is_file()
         {
@@ -109,13 +115,14 @@ impl Browser {
         Ok(())
     }
 
-    pub(super) fn set_mode(&mut self, restricted: bool) {
-        if self.restricted != restricted {
+    pub(super) fn set_visibility(&mut self, restricted: bool, show_hidden: bool) {
+        if self.restricted != restricted || self.show_hidden != show_hidden {
             self.restricted = restricted;
+            self.show_hidden = show_hidden;
             self.parents = self
                 .directory
                 .parent()
-                .and_then(|parent| entries(parent, restricted).ok())
+                .and_then(|parent| entries(parent, restricted, show_hidden).ok())
                 .unwrap_or_default();
             self.update_files(self.cursor);
         }
@@ -134,6 +141,7 @@ impl Browser {
             .iter()
             .filter(|entry| {
                 (!self.restricted || entry.kind != Kind::Other)
+                    && (self.show_hidden || !is_hidden(&entry.path))
                     && (query.is_empty() || entry.label.to_lowercase().contains(&query))
             })
             .cloned()
@@ -189,10 +197,18 @@ pub(super) fn terminal_text(path: &Path) -> String {
         .collect()
 }
 
-pub(super) fn entries(path: &Path, restricted: bool) -> io::Result<Vec<Entry>> {
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
+}
+
+pub(super) fn entries(path: &Path, restricted: bool, show_hidden: bool) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for entry in path.read_dir()?.filter_map(Result::ok) {
         let path = entry.path();
+        if !show_hidden && is_hidden(&path) {
+            continue;
+        }
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -255,6 +271,20 @@ mod tests {
         let entry = browser.selected().unwrap();
         assert_eq!(entry.label, "measurement");
         assert_eq!(entry.kind, Kind::Mpr);
+    }
+
+    #[test]
+    fn opens_a_hidden_file_explicitly_and_allows_hiding_it_again() {
+        let scratch = tempdir().unwrap();
+        let requested = scratch.path().join(".requested.mpr");
+        fs::write(&requested, []).unwrap();
+        fs::write(scratch.path().join("other.mpr"), []).unwrap();
+
+        let mut browser = Browser::open(&requested).unwrap();
+        assert_eq!(browser.selected().unwrap().label, ".requested.mpr");
+        assert!(browser.show_hidden);
+        browser.set_visibility(true, false);
+        assert_eq!(browser.selected().unwrap().label, "other.mpr");
     }
 
     #[test]
