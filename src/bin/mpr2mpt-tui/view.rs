@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 use super::browser::{Entry, Kind, terminal_text};
 use super::footer;
 use super::jobs::{PendingOverwrite, Report};
-use super::{App, Detail, PreviewFocus, PromptKind, safe_text};
+use super::{App, Detail, PromptKind, safe_text};
 
 const ACCENT: Color = Color::Cyan;
 
@@ -25,8 +25,14 @@ impl App {
             0
         };
         let hints = footer::shortcuts(self, area.width);
-        // Each stacked pane needs two border rows and one content row.
-        let minimum_panes = if area.width < 64 { 6 } else { 4 };
+        // A stacked MPR preview needs room for its metadata, column labels, and a data row.
+        let minimum_panes = if area.width >= 64 {
+            4
+        } else if !self.show_report && matches!(self.detail, Detail::Inspection(_)) {
+            8
+        } else {
+            6
+        };
         let help_height = (hints.len() as u16).min(
             area.height
                 .saturating_sub(4 + minimum_panes + prompt_height)
@@ -47,10 +53,7 @@ impl App {
             ]),
             heading,
         );
-        if self.pending_overwrite.is_some()
-            || self.preview_focus == Some(PreviewFocus::Expanded)
-            || (self.preview_focus.is_some() && panes.width < 64)
-        {
+        if self.pending_overwrite.is_some() {
             self.draw_details(frame, panes);
         } else {
             self.draw_browser(frame, panes);
@@ -108,9 +111,17 @@ impl App {
                     .areas(panes);
             (files, details)
         } else {
-            let [files, details] =
-                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .areas(panes);
+            let stack = if self.preview_focused
+                || (!self.show_report && matches!(self.detail, Detail::Inspection(_)))
+            {
+                [
+                    Constraint::Length((panes.height / 3).max(3)),
+                    Constraint::Min(0),
+                ]
+            } else {
+                [Constraint::Percentage(50), Constraint::Percentage(50)]
+            };
+            let [files, details] = Layout::vertical(stack).areas(panes);
             (files, details)
         };
         draw_entries(
@@ -156,7 +167,7 @@ impl App {
                 } else {
                     name
                 };
-                let block = if self.preview_focus.is_some() {
+                let block = if self.preview_focused {
                     panel(title).border_style(ACCENT)
                 } else {
                     panel(title)

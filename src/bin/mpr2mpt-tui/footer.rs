@@ -56,16 +56,17 @@ pub(super) fn shortcuts(app: &App, width: u16) -> Vec<Line<'static>> {
         &[("y", "Copy"), ("Esc", "Cancel")]
     } else if app.prompt.is_some() {
         &[("Enter", "Apply"), ("Esc", "Back"), ("Ctrl+U", "Clear")]
-    } else if app.preview_focus.is_some() && matches!(app.detail, Detail::Inspection(_)) {
+    } else if app.preview_focused && matches!(app.detail, Detail::Inspection(_)) {
         &[
             ("h / Esc", "Files"),
             ("j/k", "Rows"),
             ("gg/G", "Top/End"),
             ("J/K", "Metadata"),
             ("[ ]", "Cols"),
+            ("v", "Close"),
             ("c", "Convert"),
         ]
-    } else if app.preview_focus.is_some() {
+    } else if app.preview_focused {
         &[
             ("h / Esc", "Files"),
             ("j/k", "Rows"),

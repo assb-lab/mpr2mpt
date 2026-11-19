@@ -145,12 +145,6 @@ enum Detail {
     Error(String),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PreviewFocus {
-    Pane,
-    Expanded,
-}
-
 enum PromptKind {
     Path,
     Output,
@@ -176,7 +170,7 @@ struct App {
     browser: Browser,
     marked: BTreeSet<PathBuf>,
     detail: Detail,
-    preview_focus: Option<PreviewFocus>,
+    preview_focused: bool,
     preview_column: usize,
     preview_row: usize,
     output: Option<PathBuf>,
@@ -200,7 +194,7 @@ impl App {
             browser: Browser::open(args.input.as_deref().unwrap_or_else(|| Path::new(".")))?,
             marked: BTreeSet::new(),
             detail: Detail::Empty,
-            preview_focus: None,
+            preview_focused: false,
             preview_column: 0,
             preview_row: 0,
             output: args.output.map(std::path::absolute).transpose()?,
@@ -247,7 +241,10 @@ impl App {
             return false;
         }
         match key.code {
-            KeyCode::Esc if self.preview_focus.is_some() => self.leave_preview(),
+            KeyCode::Esc if self.preview_focused => self.preview_focused = false,
+            KeyCode::Esc if !self.show_report && matches!(self.detail, Detail::Inspection(_)) => {
+                self.update_detail()
+            }
             KeyCode::Esc if !self.browser.filter.is_empty() => self.set_filter(String::new()),
             KeyCode::Esc | KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('Q') => {
@@ -255,8 +252,8 @@ impl App {
                 return self.quit();
             }
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
-                if self.preview_focus.is_some() {
-                    self.leave_preview();
+                if self.preview_focused {
+                    self.preview_focused = false;
                 } else {
                     self.parent();
                 }
@@ -305,7 +302,7 @@ impl App {
             KeyCode::Char('o') => self.open_prompt(PromptKind::Output),
             KeyCode::Char('r') => self.reload(),
             KeyCode::Tab if self.report.is_some() => {
-                self.leave_preview();
+                self.preview_focused = false;
                 self.show_report = !self.show_report;
             }
             KeyCode::PageUp => self.move_details(-1, 0),
@@ -323,7 +320,7 @@ impl App {
     }
 
     fn walk(&mut self, distance: isize) {
-        if self.preview_focus.is_some() {
+        if self.preview_focused {
             self.move_details(distance, 0);
             return;
         }
@@ -466,14 +463,17 @@ impl App {
         match self.browser.selected() {
             Some(entry) if entry.kind == Kind::Directory => self.open_path(entry.path.clone()),
             Some(entry) if convert_mpr && entry.kind == Kind::Mpr => self.start_conversion(),
-            Some(entry)
-                if !convert_mpr && self.preview_focus.is_none() && entry.kind == Kind::Mpr =>
-            {
-                self.open_inspection(PreviewFocus::Pane);
-            }
-            Some(_) if !convert_mpr && matches!(self.detail, Detail::Mpt(_) | Detail::Text(_)) => {
-                self.preview_focus = Some(PreviewFocus::Pane);
-                self.show_report = false;
+            Some(entry) if !convert_mpr => {
+                if entry.kind == Kind::Mpr && !matches!(self.detail, Detail::Inspection(_)) {
+                    self.open_inspection();
+                }
+                if matches!(
+                    self.detail,
+                    Detail::Inspection(_) | Detail::Mpt(_) | Detail::Text(_)
+                ) {
+                    self.preview_focused = true;
+                    self.show_report = false;
+                }
             }
             Some(entry) if entry.kind == Kind::Mpt => self.show_report = false,
             _ => {}
@@ -510,8 +510,9 @@ impl App {
 
     fn reload(&mut self) {
         let focused_path = self
-            .preview_focus
-            .and_then(|_| self.browser.selected())
+            .browser
+            .selected()
+            .filter(|_| self.preview_focused)
             .map(|entry| entry.path.clone());
         let (row, column) = (self.preview_row, self.preview_column);
         if let Err(error) = self.browser.reload() {
@@ -526,13 +527,13 @@ impl App {
                 .is_some_and(|entry| entry.path == path)
             && matches!(self.detail, Detail::Mpt(_) | Detail::Text(_))
         {
-            self.preview_focus = Some(PreviewFocus::Pane);
+            self.preview_focused = true;
             self.move_details(row as isize, column as isize);
         }
     }
 
     fn update_detail(&mut self) {
-        self.preview_focus = None;
+        self.preview_focused = false;
         self.preview_column = 0;
         self.preview_row = 0;
         self.detail = match self.browser.selected() {
@@ -743,7 +744,7 @@ impl App {
         let inputs = jobs.iter().map(|job| job.input.clone()).collect();
         match RunningBatch::start(jobs, approvals) {
             Ok(worker) => {
-                self.leave_preview();
+                self.preview_focused = false;
                 self.report = Some(Report::new(inputs));
                 self.running = Some(worker);
                 self.show_report = true;
@@ -753,16 +754,18 @@ impl App {
     }
 
     fn toggle_inspection(&mut self) {
-        if self.preview_focus == Some(PreviewFocus::Expanded) {
-            self.leave_preview();
-        } else if matches!(self.detail, Detail::Inspection(_)) {
-            self.preview_focus = Some(PreviewFocus::Expanded);
+        if matches!(self.detail, Detail::Inspection(_)) {
+            if self.show_report {
+                self.show_report = false;
+            } else {
+                self.update_detail();
+            }
         } else {
-            self.open_inspection(PreviewFocus::Expanded);
+            self.open_inspection();
         }
     }
 
-    fn open_inspection(&mut self, focus: PreviewFocus) {
+    fn open_inspection(&mut self) {
         if self.running.is_some() {
             self.message = Some("Wait for the active conversion before opening a preview.".into());
             return;
@@ -778,7 +781,6 @@ impl App {
         match mpr2mpt::inspect(&entry.path) {
             Ok(inspection) => {
                 self.detail = Detail::Inspection(InspectionView::from(inspection));
-                self.preview_focus = Some(focus);
                 self.show_report = false;
                 self.preview_column = 0;
                 self.preview_row = 0;
@@ -787,14 +789,10 @@ impl App {
         }
     }
 
-    fn leave_preview(&mut self) {
-        if self.preview_focus.take().is_some() && matches!(self.detail, Detail::Inspection(_)) {
-            self.update_detail();
-        }
-    }
-
     fn move_metadata(&mut self, distance: isize) {
-        if let Detail::Inspection(preview) = &mut self.detail {
+        if self.preview_focused
+            && let Detail::Inspection(preview) = &mut self.detail
+        {
             preview.metadata_start =
                 shift(preview.metadata_start, distance, preview.metadata.len());
         }
