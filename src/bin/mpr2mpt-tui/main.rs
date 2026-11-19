@@ -534,8 +534,7 @@ impl App {
 
     fn open_prompt(&mut self, kind: PromptKind) {
         let value = match &kind {
-            PromptKind::Path => String::new(),
-            PromptKind::Filter { previous, .. } => previous.clone(),
+            PromptKind::Path | PromptKind::Filter { .. } => String::new(),
             PromptKind::Output => match self.output.as_deref() {
                 Some(path) => match path
                     .to_str()
@@ -563,7 +562,7 @@ impl App {
         };
         if text.chars().any(char::is_control) {
             self.message = Some("Paste one path without control characters.".into());
-        } else {
+        } else if !text.is_empty() {
             prompt.field.insert(text);
             self.refresh_filter();
         }
@@ -611,12 +610,14 @@ impl App {
                         self.output =
                             (!value.is_empty()).then(|| self.browser.directory.join(value));
                     }
-                    PromptKind::Filter { .. } | PromptKind::Path => {}
+                    PromptKind::Filter { .. } => self.set_filter(prompt.field.value),
+                    PromptKind::Path => {}
                 }
             }
             _ => {
-                if let Some(prompt) = &mut self.prompt {
-                    prompt.field.edit(key);
+                if let Some(prompt) = &mut self.prompt
+                    && prompt.field.edit(key)
+                {
                     self.refresh_filter();
                 }
             }
@@ -829,6 +830,38 @@ mod navigation_tests {
         assert_eq!(app.browser.files.len(), 1);
         assert_eq!(app.browser.selected().unwrap().label, "beta.MPS");
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.browser.files.len(), 2);
+    }
+
+    #[test]
+    fn reopens_filter_blank_and_clears_it_on_empty_enter() {
+        let scratch = tempfile::tempdir().unwrap();
+        fs::write(scratch.path().join("alpha.mpr"), []).unwrap();
+        fs::write(scratch.path().join("beta.mpr"), []).unwrap();
+        let mut app = app_at(scratch.path());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        app.key(key('f'));
+        app.key(key('b'));
+        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.selected().unwrap().label, "beta.mpr");
+        app.key(enter);
+
+        app.key(key('f'));
+        assert!(app.prompt.as_ref().unwrap().field.value.is_empty());
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.browser.files.len(), 1);
+
+        app.key(key('l'));
+        assert_eq!(app.browser.selected().unwrap().label, "alpha.mpr");
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.browser.selected().unwrap().label, "beta.mpr");
+        assert_eq!(app.browser.files.len(), 1);
+
+        app.key(key('f'));
+        app.key(enter);
+        assert!(app.prompt.is_none());
+        assert!(app.browser.filter.is_empty());
         assert_eq!(app.browser.files.len(), 2);
     }
 

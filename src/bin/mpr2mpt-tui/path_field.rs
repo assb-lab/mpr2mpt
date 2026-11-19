@@ -52,7 +52,8 @@ impl PathField {
         (before, boundaries.next())
     }
 
-    pub(super) fn edit(&mut self, key: KeyEvent) {
+    pub(super) fn edit(&mut self, key: KeyEvent) -> bool {
+        let original_len = self.value.len();
         match key.code {
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.value.clear();
@@ -85,6 +86,7 @@ impl PathField {
             }
             _ => {}
         }
+        self.value.len() != original_len
     }
 
     fn viewport(&self, width: u16) -> (&str, u16) {

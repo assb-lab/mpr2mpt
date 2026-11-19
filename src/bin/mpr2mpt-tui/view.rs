@@ -59,7 +59,7 @@ impl App {
             let (title, placeholder) = match &edit.kind {
                 PromptKind::Path => ("Go to path", "Folder or measurement file"),
                 PromptKind::Output => ("Single-file output", "Empty uses the source folder"),
-                PromptKind::Filter { .. } => ("Filter files", "Filter by name"),
+                PromptKind::Filter { .. } => ("Filter files", ""),
             };
             edit.field.draw(frame, prompt, title, placeholder, true);
         }
