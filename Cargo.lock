@@ -541,9 +541,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crossterm",
+ "libc",
  "openreadout-core",
  "openreadout-echem",
  "ratatui",
+ "rayon",
+ "rustix",
  "tempfile",
  "thiserror",
 ]
