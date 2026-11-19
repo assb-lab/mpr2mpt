@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 
 use super::browser::{Entry, Kind, terminal_text};
+use super::footer;
 use super::jobs::Report;
 use super::{App, Detail, PromptKind, safe_text};
 
@@ -23,12 +24,20 @@ impl App {
         } else {
             0
         };
-        let [heading, panes, status, prompt, help] = Layout::vertical([
+        let hints = footer::shortcuts(self, area.width);
+        // Each stacked pane needs two border rows and one content row.
+        let minimum_panes = if area.width < 64 { 6 } else { 4 };
+        let help_height = (hints.len() as u16).min(
+            area.height
+                .saturating_sub(4 + minimum_panes + prompt_height)
+                .max(1),
+        );
+        let [heading, panes, prompt, status, help] = Layout::vertical([
             Constraint::Length(2),
-            Constraint::Min(4),
-            Constraint::Length(2),
+            Constraint::Min(minimum_panes),
             Constraint::Length(prompt_height),
-            Constraint::Length(if area.width >= 92 { 2 } else { 3 }),
+            Constraint::Length(2),
+            Constraint::Length(help_height),
         ])
         .areas(area);
         frame.render_widget(
@@ -50,7 +59,15 @@ impl App {
                 .parents
                 .iter()
                 .position(|entry| entry.path == self.browser.directory);
-            draw_entries(frame, parent, "Parent", &self.browser.parents, focus, None);
+            draw_entries(
+                frame,
+                parent,
+                "Parent",
+                &self.browser.parents,
+                focus,
+                None,
+                self.plain_icons,
+            );
             (files, details)
         } else if panes.width >= 64 {
             let [files, details] =
@@ -74,9 +91,10 @@ impl App {
             &self.browser.files,
             Some(self.browser.cursor),
             Some(&self.marked),
+            self.plain_icons,
         );
         self.draw_details(frame, details);
-        self.draw_status(frame, status);
+        footer::draw_status(self, frame, status);
         if let Some(edit) = &self.prompt {
             let (title, placeholder) = match &edit.kind {
                 PromptKind::Path => ("Go to path", "Folder or measurement file"),
@@ -97,21 +115,7 @@ impl App {
             ];
             frame.render_widget(Paragraph::new(lines), inner);
         }
-        let hint = if self.trash_target.is_some() {
-            "y Confirm   n / Esc Cancel"
-        } else if self.pending_jump {
-            "g Top   d Downloads   h Home   t Trash"
-        } else if self.prompt.is_some() {
-            "Enter  Apply    Esc  Back    Ctrl+U  Clear"
-        } else if area.width >= 92 {
-            "j/k Move   h/l Folder   g… Jump   p Path   f Filter   m Mode   d Trash   q Quit\nSpace Mark   x Clear   c Convert   o Output   Tab Results   PgUp/Dn Rows   [ ] Cols   r Reload"
-        } else {
-            "j/k Move  h/l Folder  g… Jump  p Path\nf Filter  m Mode  d Trash  Space Mark  c Convert\nTab Results  PgUp/Dn Rows  [ ] Cols  q Quit"
-        };
-        frame.render_widget(
-            Paragraph::new(hint).wrap(Wrap { trim: true }).dark_gray(),
-            help,
-        );
+        footer::draw_shortcuts(frame, help, hints);
     }
 
     fn draw_details(&self, frame: &mut Frame, area: Rect) {
@@ -126,7 +130,9 @@ impl App {
             .selected()
             .map_or("Preview", |entry| entry.label.as_str());
         match &self.detail {
-            Detail::Folder(entries) => draw_entries(frame, area, name, entries, None, None),
+            Detail::Folder(entries) => {
+                draw_entries(frame, area, name, entries, None, None, self.plain_icons)
+            }
             detail => {
                 let block = panel(name);
                 let inner = block.inner(area);
@@ -162,44 +168,6 @@ impl App {
             }
         }
     }
-
-    fn draw_status(&self, frame: &mut Frame, area: Rect) {
-        let mut parts = vec![Span::styled(
-            format!("{} marked", self.marked.len()),
-            Style::new().fg(ACCENT),
-        )];
-        if let Some(report) = &self.report {
-            let done = if report.failure.is_some() {
-                report.results.len()
-            } else {
-                report.results.iter().flatten().count()
-            };
-            let written = report
-                .results
-                .iter()
-                .flatten()
-                .filter(|item| item.is_ok())
-                .count();
-            parts.push(Span::raw(format!(
-                "  |  {done}/{}  ·  {written} written  ·  {} failed",
-                report.results.len(),
-                done - written
-            )));
-        }
-        let filter = format!("Filter: {}", self.browser.filter);
-        let secondary = if self.exit_when_done {
-            Some("Exiting after the active conversion…")
-        } else {
-            self.message
-                .as_deref()
-                .or_else(|| (!self.browser.filter.is_empty()).then_some(filter.as_str()))
-        };
-        let mut lines = vec![Line::from(parts)];
-        if let Some(message) = secondary {
-            lines.push(Line::raw(message).yellow());
-        }
-        frame.render_widget(Paragraph::new(lines), area);
-    }
 }
 
 fn panel(title: &str) -> Block<'_> {
@@ -221,6 +189,7 @@ fn draw_entries(
     entries: &[Entry],
     focus: Option<usize>,
     marked: Option<&BTreeSet<PathBuf>>,
+    plain_icons: bool,
 ) {
     let block = panel(title);
     let inner = block.inner(area);
@@ -238,32 +207,65 @@ fn draw_entries(
         .take(slots)
         .map(|(i, entry)| {
             let marked = marked.is_some_and(|marks| marks.contains(&entry.path));
-            let leader = match (entry.kind, marked) {
-                (_, true) => "✓ ",
-                (Kind::Directory, false) => "▸ ",
-                (Kind::Mpr, false) => "◇ ",
-                (Kind::Mps, false) => "⚙ ",
-                (Kind::Mpt, false) => "≡ ",
-                (Kind::Other, false) => "· ",
-            };
-            let color = if marked { Color::LightGreen } else { ACCENT };
+            let (icon, plain, color) = file_style(entry.kind, &entry.path);
             let line = Line::from(vec![
-                Span::styled(leader, Style::new().fg(color)),
-                Span::raw(&entry.label),
+                if marked {
+                    Span::raw("✓ ").fg(Color::LightGreen)
+                } else {
+                    Span::raw("  ")
+                },
+                Span::raw(if plain_icons { plain } else { icon }).fg(color),
+                Span::raw(" "),
+                Span::raw(&entry.label).fg(color),
             ]);
             let item = ListItem::new(line);
             if focus == Some(i) {
-                item.style(
-                    Style::new()
-                        .fg(Color::White)
-                        .bg(Color::Rgb(36, 65, 75))
-                        .bold(),
-                )
+                item.style(Style::new().bg(Color::Rgb(36, 65, 75)).bold())
             } else {
                 item
             }
         });
     frame.render_widget(List::new(items), inner);
+}
+
+fn file_style(kind: Kind, path: &Path) -> (&'static str, &'static str, Color) {
+    match kind {
+        Kind::Directory => return ("\u{f07b}", "▸", Color::LightBlue),
+        Kind::Mpr => return ("\u{f0c3}", "◇", Color::LightYellow),
+        Kind::Mps => return ("\u{f1de}", "⚙", Color::LightMagenta),
+        Kind::Mpt => return ("\u{f0ce}", "≡", Color::LightCyan),
+        Kind::Other => {}
+    }
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+    let (icon, plain) = match extension.as_deref() {
+        Some("mpl") => return ("\u{f0f6}", "¶", Color::LightCyan),
+        Some("mpls" | "mpsl") => return ("\u{f1de}", "⚙", Color::LightMagenta),
+        Some("mpp") => return ("\u{f0c3}", "◇", Color::LightYellow),
+        Some(
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg" | "heic" | "tif" | "tiff" | "bmp"
+            | "ico" | "avif",
+        ) => ("\u{f1c5}", "▧"),
+        Some("pdf") => ("\u{f1c1}", "¶"),
+        Some("doc" | "docx" | "odt" | "rtf") => ("\u{f1c2}", "¶"),
+        Some("csv" | "tsv" | "xls" | "xlsx" | "ods") => ("\u{f1c3}", "≡"),
+        Some("ppt" | "pptx" | "odp") => ("\u{f1c4}", "▤"),
+        Some("zip" | "gz" | "bz2" | "xz" | "tar" | "tgz" | "rar" | "7z" | "dmg" | "iso") => {
+            ("\u{f1c6}", "□")
+        }
+        Some("wav" | "mp3" | "ogg" | "flac" | "aac" | "m4a") => ("\u{f1c7}", "♪"),
+        Some("mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v") => ("\u{f1c8}", "▷"),
+        Some(
+            "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "html" | "css" | "sh" | "c" | "cpp" | "go"
+            | "rb" | "ipynb",
+        ) => ("\u{f121}", "⌘"),
+        Some("json" | "toml" | "yaml" | "yml" | "ini" | "conf") => ("\u{f013}", "⚙"),
+        Some("txt" | "md" | "rst" | "tex" | "log") => ("\u{f0f6}", "¶"),
+        _ => ("\u{f15b}", "·"),
+    };
+    (icon, plain, Color::Reset)
 }
 
 impl Report {
@@ -319,5 +321,34 @@ impl Report {
             ),
         };
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), summary);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colors_only_directories_and_biologic_files() {
+        assert_eq!(
+            file_style(Kind::Directory, Path::new("dir")).2,
+            Color::LightBlue
+        );
+        let measurements = [
+            file_style(Kind::Mpr, Path::new("sample.MPR")),
+            file_style(Kind::Mps, Path::new("sample.MPS")),
+            file_style(Kind::Mpt, Path::new("sample.MPT")),
+        ];
+        assert_ne!(measurements[0].2, measurements[1].2);
+        assert_ne!(measurements[1].2, measurements[2].2);
+        let image = file_style(Kind::Other, Path::new("figure.PNG"));
+        let doc = file_style(Kind::Other, Path::new("reference.pdf"));
+        assert_eq!(image.2, Color::Reset);
+        assert_eq!(doc.2, Color::Reset);
+        assert_ne!(image.0, doc.0);
+        assert_ne!(
+            file_style(Kind::Other, Path::new("sample.MPL")).2,
+            Color::Reset
+        );
     }
 }

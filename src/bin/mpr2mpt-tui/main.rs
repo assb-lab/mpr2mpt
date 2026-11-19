@@ -1,4 +1,5 @@
 mod browser;
+mod footer;
 mod jobs;
 mod path_field;
 mod preview;
@@ -42,6 +43,9 @@ struct Args {
     /// Output MPT path for a single input
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
+    /// Use standard text symbols instead of Nerd Font icons
+    #[arg(long)]
+    plain_icons: bool,
 }
 
 fn main() -> ExitCode {
@@ -124,6 +128,7 @@ struct Prompt {
 }
 
 struct App {
+    plain_icons: bool,
     browser: Browser,
     marked: BTreeSet<PathBuf>,
     detail: Detail,
@@ -143,6 +148,7 @@ struct App {
 impl App {
     fn new(args: Args) -> io::Result<Self> {
         let mut app = Self {
+            plain_icons: args.plain_icons,
             browser: Browser::open(args.input.as_deref().unwrap_or_else(|| Path::new(".")))?,
             marked: BTreeSet::new(),
             detail: Detail::Empty,
@@ -583,6 +589,7 @@ mod navigation_tests {
         App::new(Args {
             input: Some(path.into()),
             output: None,
+            plain_icons: false,
         })
         .unwrap()
     }
