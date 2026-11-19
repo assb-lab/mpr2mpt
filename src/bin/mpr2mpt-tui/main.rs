@@ -10,7 +10,7 @@ mod view;
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
@@ -103,11 +103,14 @@ fn run_terminal(app: &mut App) -> io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     loop {
         app.receive_results();
+        app.poll_launchers();
         if app.exit_when_done && app.running.is_none() {
             return Ok(());
         }
         terminal.draw(|frame| app.draw(frame))?;
-        if app.running.is_some() && !event::poll(Duration::from_millis(75))? {
+        if (app.running.is_some() || !app.launchers.is_empty())
+            && !event::poll(Duration::from_millis(75))?
+        {
             continue;
         }
         match event::read()? {
@@ -148,7 +151,9 @@ enum Detail {
 
 enum PromptKind {
     Path,
-    Output,
+    Output {
+        input: PathBuf,
+    },
     Filter {
         previous: String,
         focus: Option<PathBuf>,
@@ -184,6 +189,7 @@ struct App {
     report: Option<Report>,
     show_report: bool,
     running: Option<RunningBatch>,
+    launchers: Vec<Child>,
     exit_when_done: bool,
     exit_directory: Option<PathBuf>,
     message: Option<String>,
@@ -208,6 +214,7 @@ impl App {
             report: None,
             show_report: false,
             running: None,
+            launchers: Vec::new(),
             exit_when_done: false,
             exit_directory: None,
             message: None,
@@ -276,6 +283,12 @@ impl App {
             KeyCode::Char('e') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
                 self.start_conversion()
             }
+            KeyCode::Char('E')
+                if key.kind == KeyEventKind::Press
+                    && key.modifiers.difference(KeyModifiers::SHIFT).is_empty() =>
+            {
+                self.prompt_named_conversion();
+            }
             KeyCode::Char('c') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
                 self.prefix = Some(Prefix::CopyPath)
             }
@@ -306,7 +319,9 @@ impl App {
                 self.update_detail();
             }
             KeyCode::Char('d') if key.kind == KeyEventKind::Press => self.request_trash(),
-            KeyCode::Char('o') => self.open_prompt(PromptKind::Output),
+            KeyCode::Char('o') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+                self.launch_selected();
+            }
             KeyCode::Char('r') => self.reload(),
             KeyCode::Tab if self.report.is_some() => {
                 self.preview_focused = false;
@@ -527,13 +542,73 @@ impl App {
     }
 
     fn open_result(&mut self) {
-        if let Some(report) = &self.report
-            && let Some(Some(Ok(result))) = report.results.get(report.cursor)
-        {
-            match Browser::open_output(&result.output) {
+        if let Some(path) = self.selected_output() {
+            match Browser::open_output(path) {
                 Ok(browser) => self.set_browser(browser),
                 Err(error) => self.show_error(error),
             }
+        }
+    }
+
+    fn selected_output(&self) -> Option<&Path> {
+        let report = self.report.as_ref()?;
+        let result = report.results.get(report.cursor)?.as_ref()?.as_ref().ok()?;
+        Some(result.output.as_path())
+    }
+
+    fn launch_selected(&mut self) {
+        let path = if self.show_report {
+            self.selected_output()
+        } else {
+            self.browser.selected().map(|entry| entry.path.as_path())
+        };
+        let Some(path) = path else {
+            self.message = Some("Select an item to open.".into());
+            return;
+        };
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(target_os = "linux") {
+            "xdg-open"
+        } else {
+            self.message =
+                Some("Opening in the default app is unavailable on this platform.".into());
+            return;
+        };
+        match Command::new(program)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                self.launchers.push(child);
+                self.message = Some("Sent to the default app.".into());
+            }
+            Err(error) => self.show_error(format!("Cannot start {program}: {error}")),
+        }
+    }
+
+    fn poll_launchers(&mut self) {
+        let mut error = None;
+        self.launchers.retain_mut(|child| {
+            match child.try_wait() {
+                Ok(None) => return true,
+                Ok(Some(status)) if status.success() => {}
+                Ok(Some(status)) => {
+                    error = Some(format!("Default app launcher exited with {status}."))
+                }
+                Err(wait_error) => {
+                    error = Some(format!(
+                        "Cannot check the default app launcher: {wait_error}"
+                    ))
+                }
+            }
+            false
+        });
+        if let Some(error) = error {
+            self.show_error(error);
         }
     }
 
@@ -614,15 +689,14 @@ impl App {
     fn open_prompt(&mut self, kind: PromptKind) {
         let value = match &kind {
             PromptKind::Path | PromptKind::Filter { .. } => String::new(),
-            PromptKind::Output => match self.output.as_deref() {
+            PromptKind::Output { .. } => match self.output.as_deref() {
                 Some(path) => match path
                     .to_str()
                     .filter(|text| !text.chars().any(char::is_control))
                 {
                     Some(text) => text.to_owned(),
                     None => {
-                        self.message =
-                            Some("Type a new output path, or Esc to keep the current one.".into());
+                        self.message = Some("Type an output path, or press Esc to cancel.".into());
                         String::new()
                     }
                 },
@@ -685,9 +759,9 @@ impl App {
                     PromptKind::Path if !value.is_empty() => {
                         self.open_path(self.browser.directory.join(value));
                     }
-                    PromptKind::Output => {
-                        self.output =
-                            (!value.is_empty()).then(|| self.browser.directory.join(value));
+                    PromptKind::Output { input } => {
+                        let output = (!value.is_empty()).then(|| input.with_file_name(value));
+                        self.queue_conversion(vec![BatchJob { input, output }]);
                     }
                     PromptKind::Filter { .. } => self.set_filter(prompt.field.value),
                     PromptKind::Path => {}
@@ -700,6 +774,24 @@ impl App {
                     self.refresh_filter();
                 }
             }
+        }
+    }
+
+    fn prompt_named_conversion(&mut self) {
+        if self.running.is_some() {
+            self.message = Some("Wait for the active conversion before starting another.".into());
+            return;
+        }
+        if let Some(entry) = self
+            .browser
+            .selected()
+            .filter(|entry| entry.kind == Kind::Mpr)
+        {
+            self.open_prompt(PromptKind::Output {
+                input: entry.path.clone(),
+            });
+        } else {
+            self.message = Some("Select an MPR to convert.".into());
         }
     }
 
@@ -721,7 +813,8 @@ impl App {
             return;
         }
         if checked.len() > 1 && self.output.is_some() {
-            self.message = Some("Clear the single-file output with o before a batch.".into());
+            self.message =
+                Some("The -o option requires one input. Restart without -o for a batch.".into());
             return;
         }
         let jobs: Vec<_> = checked
@@ -731,6 +824,10 @@ impl App {
                 output: self.output.clone(),
             })
             .collect();
+        self.queue_conversion(jobs);
+    }
+
+    fn queue_conversion(&mut self, jobs: Vec<BatchJob>) {
         let pending = PendingOverwrite::scan(jobs);
         if pending.existing.is_empty() {
             self.run_jobs(pending.jobs, HashMap::new());
@@ -1130,6 +1227,36 @@ mod navigation_tests {
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.key(key('e'));
         assert!(app.pending_overwrite.is_some());
+        assert_eq!(fs::read(output).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn shifted_e_checks_only_the_cursor_mpr_and_its_named_output() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("first.mpr");
+        fs::write(&source, []).unwrap();
+        fs::write(scratch.path().join("second.mpr"), []).unwrap();
+        let output = scratch.path().join("named result.mpt");
+        fs::write(&output, b"existing").unwrap();
+        let mut app = app_at(&source);
+        app.marked.extend(
+            app.browser
+                .files
+                .iter()
+                .filter_map(|entry| (entry.kind == Kind::Mpr).then_some(entry.path.clone())),
+        );
+
+        app.key(KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        assert!(app.prompt.is_some());
+        app.paste("named result.mpt");
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let pending = app.pending_overwrite.as_ref().unwrap();
+        assert_eq!(pending.jobs.len(), 1);
+        let job = &pending.jobs[0];
+        assert_eq!(job.input, app.browser.selected().unwrap().path);
+        assert_eq!(job.destination(), output.canonicalize().unwrap());
+        assert_eq!(app.marked.len(), 2);
+        assert!(app.output.is_none());
         assert_eq!(fs::read(output).unwrap(), b"existing");
     }
 

@@ -62,7 +62,7 @@ impl App {
         if let Some(edit) = &self.prompt {
             let (title, placeholder) = match &edit.kind {
                 PromptKind::Path => ("Go to path", "Folder or measurement file"),
-                PromptKind::Output => ("Single-file output", "Empty uses the source folder"),
+                PromptKind::Output { .. } => ("Convert MPR as", "Empty uses the default .mpt name"),
                 PromptKind::Filter { .. } => ("Filter files", ""),
             };
             edit.field.draw(frame, prompt, title, placeholder, true);

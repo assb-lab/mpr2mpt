@@ -4,7 +4,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::{App, Detail, Prefix};
+use super::{App, Detail, Prefix, PromptKind};
 
 const GUIDE: Color = Color::Rgb(23, 33, 49);
 const KEY: Color = Color::Rgb(50, 69, 94);
@@ -15,7 +15,8 @@ const INK: Color = Color::Rgb(16, 32, 51);
 const NORMAL: &[(&str, &str)] = &[
     ("j/k", "Move"),
     ("h/l", "Back/Open"),
-    ("e", "Convert"),
+    ("e/E", "Convert/As"),
+    ("o", "Open"),
     ("c…", "Copy path"),
     ("v", "Preview"),
     ("q/Q", "Quit/cd"),
@@ -27,7 +28,6 @@ const NORMAL: &[(&str, &str)] = &[
     ("d", "Trash"),
     ("Space", "Mark"),
     ("x", "Clear"),
-    ("o", "Output"),
     ("Tab", "Results"),
     ("PgUp/Dn", "Rows"),
     ("[ ]", "Cols"),
@@ -62,6 +62,12 @@ pub(super) fn shortcuts(app: &App, width: u16) -> Vec<Line<'static>> {
             ("n", "Stem"),
             ("Esc", "Cancel"),
         ]
+    } else if app
+        .prompt
+        .as_ref()
+        .is_some_and(|prompt| matches!(prompt.kind, PromptKind::Output { .. }))
+    {
+        &[("Enter", "Convert"), ("Esc", "Cancel"), ("Ctrl+U", "Clear")]
     } else if app.prompt.is_some() {
         &[("Enter", "Apply"), ("Esc", "Back"), ("Ctrl+U", "Clear")]
     } else if app.preview_focused && matches!(app.detail, Detail::Inspection(_)) {
@@ -72,7 +78,8 @@ pub(super) fn shortcuts(app: &App, width: u16) -> Vec<Line<'static>> {
             ("J/K", "Metadata"),
             ("[ ]", "Cols"),
             ("v", "Close"),
-            ("e", "Convert"),
+            ("e/E", "Convert/As"),
+            ("o", "Open"),
         ]
     } else if app.preview_focused {
         &[
@@ -80,6 +87,7 @@ pub(super) fn shortcuts(app: &App, width: u16) -> Vec<Line<'static>> {
             ("j/k", "Rows"),
             ("gg/G", "Top/End"),
             ("[ ]", "Cols"),
+            ("o", "Open"),
         ]
     } else {
         NORMAL
