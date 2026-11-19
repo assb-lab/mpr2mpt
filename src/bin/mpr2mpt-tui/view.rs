@@ -16,7 +16,13 @@ const ACCENT: Color = Color::Cyan;
 impl App {
     pub(super) fn draw(&self, frame: &mut Frame) {
         let area = frame.area().inner(Margin::new(1, 1));
-        let prompt_height = if self.prompt.is_some() { 3 } else { 0 };
+        let prompt_height = if self.trash_target.is_some() {
+            4
+        } else if self.prompt.is_some() {
+            3
+        } else {
+            0
+        };
         let [heading, panes, status, prompt, help] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(4),
@@ -60,7 +66,11 @@ impl App {
         draw_entries(
             frame,
             files,
-            "Files",
+            if self.browser.restricted {
+                "Files · MPR/MPS/MPT"
+            } else {
+                "Files · All"
+            },
             &self.browser.files,
             Some(self.browser.cursor),
             Some(&self.marked),
@@ -68,18 +78,35 @@ impl App {
         self.draw_details(frame, details);
         self.draw_status(frame, status);
         if let Some(edit) = &self.prompt {
-            let (title, placeholder) = match edit.kind {
+            let (title, placeholder) = match &edit.kind {
                 PromptKind::Path => ("Go to path", "Folder or measurement file"),
                 PromptKind::Output => ("Single-file output", "Empty uses the source folder"),
+                PromptKind::Filter { .. } => ("Filter files", "Filter by name"),
             };
             edit.field.draw(frame, prompt, title, placeholder, true);
         }
-        let hint = if self.prompt.is_some() {
+        if let Some(target) = &self.trash_target {
+            let path = &target.path;
+            let block = panel("Move to Trash?").border_style(Color::Yellow);
+            let inner = block.inner(prompt);
+            frame.render_widget(block, prompt);
+            let name = path.file_name().map_or(path.as_path(), Path::new);
+            let lines = vec![
+                Line::from(terminal_text(name)).bold(),
+                Line::from(terminal_text(path.parent().unwrap_or(path))),
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        let hint = if self.trash_target.is_some() {
+            "y Confirm   n / Esc Cancel"
+        } else if self.pending_jump {
+            "g Top   d Downloads   h Home   t Trash"
+        } else if self.prompt.is_some() {
             "Enter  Apply    Esc  Back    Ctrl+U  Clear"
         } else if area.width >= 92 {
-            "↑↓ Move   ←→ Folder   Space Mark   x Clear   c Convert   g Path   o Output\nTab Results   PgUp/Dn Rows   [ ] Columns   r Reload   q Quit"
+            "j/k Move   h/l Folder   g… Jump   p Path   f Filter   m Mode   d Trash   q Quit\nSpace Mark   x Clear   c Convert   o Output   Tab Results   PgUp/Dn Rows   [ ] Cols   r Reload"
         } else {
-            "↑↓ Move   ←→ Folder   Space Mark   c Convert\ng Path   o Output   Tab Results   PgUp/Dn Rows\n[ ] Columns   x Clear   r Reload   q Quit"
+            "j/k Move  h/l Folder  g… Jump  p Path\nf Filter  m Mode  d Trash  Space Mark  c Convert\nTab Results  PgUp/Dn Rows  [ ] Cols  q Quit"
         };
         frame.render_widget(
             Paragraph::new(hint).wrap(Wrap { trim: true }).dark_gray(),
@@ -159,10 +186,13 @@ impl App {
                 done - written
             )));
         }
+        let filter = format!("Filter: {}", self.browser.filter);
         let secondary = if self.exit_when_done {
             Some("Exiting after the active conversion…")
         } else {
-            self.message.as_deref()
+            self.message
+                .as_deref()
+                .or_else(|| (!self.browser.filter.is_empty()).then_some(filter.as_str()))
         };
         let mut lines = vec![Line::from(parts)];
         if let Some(message) = secondary {
@@ -196,7 +226,7 @@ fn draw_entries(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if entries.is_empty() {
-        frame.render_widget(Paragraph::new("No MPR or MPT files").dark_gray(), inner);
+        frame.render_widget(Paragraph::new("No matching entries").dark_gray(), inner);
         return;
     }
     let slots = usize::from(inner.height);
@@ -212,7 +242,9 @@ fn draw_entries(
                 (_, true) => "✓ ",
                 (Kind::Directory, false) => "▸ ",
                 (Kind::Mpr, false) => "◇ ",
+                (Kind::Mps, false) => "⚙ ",
                 (Kind::Mpt, false) => "≡ ",
+                (Kind::Other, false) => "· ",
             };
             let color = if marked { Color::LightGreen } else { ACCENT };
             let line = Line::from(vec![

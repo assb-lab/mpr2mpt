@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 pub(super) enum Kind {
     Directory,
     Mpr,
+    Mps,
     Mpt,
+    Other,
 }
 
 #[derive(Clone)]
@@ -20,6 +22,9 @@ pub(super) struct Browser {
     pub(super) files: Vec<Entry>,
     pub(super) parents: Vec<Entry>,
     pub(super) cursor: usize,
+    pub(super) restricted: bool,
+    pub(super) filter: String,
+    all_files: Vec<Entry>,
     explicit: Option<Entry>,
 }
 
@@ -54,21 +59,29 @@ impl Browser {
                 .or_else(|| measurement_kind(&absolute))
                 .unwrap_or(Kind::Mpr),
         });
-        let mut files = entries(&directory)?;
-        let cursor = explicit
-            .as_ref()
-            .map_or(0, |entry| keep_explicit(&mut files, entry));
+        let mut all_files = entries(&directory, false)?;
+        if let Some(entry) = &explicit {
+            keep_explicit(&mut all_files, entry);
+        }
         let parents = directory
             .parent()
-            .and_then(|parent| entries(parent).ok())
+            .and_then(|parent| entries(parent, true).ok())
             .unwrap_or_default();
-        Ok(Self {
+        let mut browser = Self {
             directory,
-            files,
+            files: Vec::new(),
             parents,
-            cursor,
+            cursor: 0,
+            restricted: true,
+            filter: String::new(),
+            all_files,
             explicit,
-        })
+        };
+        browser.update_files(0);
+        if let Some(path) = browser.explicit.as_ref().map(|entry| entry.path.clone()) {
+            browser.focus_path(&path);
+        }
+        Ok(browser)
     }
 
     pub(super) fn selected(&self) -> Option<&Entry> {
@@ -85,18 +98,50 @@ impl Browser {
     }
 
     pub(super) fn reload(&mut self) -> io::Result<()> {
-        let mut files = entries(&self.directory)?;
+        let mut files = entries(&self.directory, false)?;
         if let Some(entry) = &self.explicit
             && entry.path.is_file()
         {
             keep_explicit(&mut files, entry);
         }
-        self.cursor = self
-            .selected()
-            .and_then(|old| files.iter().position(|entry| entry.path == old.path))
-            .unwrap_or_else(|| self.cursor.min(files.len().saturating_sub(1)));
-        self.files = files;
+        self.all_files = files;
+        self.update_files(self.cursor);
         Ok(())
+    }
+
+    pub(super) fn set_mode(&mut self, restricted: bool) {
+        if self.restricted != restricted {
+            self.restricted = restricted;
+            self.parents = self
+                .directory
+                .parent()
+                .and_then(|parent| entries(parent, restricted).ok())
+                .unwrap_or_default();
+            self.update_files(self.cursor);
+        }
+    }
+
+    pub(super) fn set_filter(&mut self, query: String) {
+        self.filter = query;
+        self.update_files(0);
+    }
+
+    fn update_files(&mut self, fallback: usize) {
+        let before = self.selected().map(|entry| entry.path.clone());
+        let query = self.filter.to_lowercase();
+        self.files = self
+            .all_files
+            .iter()
+            .filter(|entry| {
+                (!self.restricted || entry.kind != Kind::Other)
+                    && (query.is_empty() || entry.label.to_lowercase().contains(&query))
+            })
+            .cloned()
+            .collect();
+        self.cursor = fallback.min(self.files.len().saturating_sub(1));
+        if let Some(path) = before {
+            self.focus_path(&path);
+        }
     }
 
     pub(super) fn focus_path(&mut self, path: &Path) {
@@ -128,6 +173,8 @@ fn measurement_kind(path: &Path) -> Option<Kind> {
     let suffix = path.extension()?;
     if suffix.eq_ignore_ascii_case("mpr") {
         Some(Kind::Mpr)
+    } else if suffix.eq_ignore_ascii_case("mps") {
+        Some(Kind::Mps)
     } else if suffix.eq_ignore_ascii_case("mpt") {
         Some(Kind::Mpt)
     } else {
@@ -142,7 +189,7 @@ pub(super) fn terminal_text(path: &Path) -> String {
         .collect()
 }
 
-pub(super) fn entries(path: &Path) -> io::Result<Vec<Entry>> {
+pub(super) fn entries(path: &Path, restricted: bool) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for entry in path.read_dir()?.filter_map(Result::ok) {
         let path = entry.path();
@@ -150,13 +197,13 @@ pub(super) fn entries(path: &Path) -> io::Result<Vec<Entry>> {
             continue;
         };
         let kind = if file_type.is_dir() || (file_type.is_symlink() && path.is_dir()) {
-            Some(Kind::Directory)
+            Kind::Directory
         } else if file_type.is_file() || (file_type.is_symlink() && path.is_file()) {
-            measurement_kind(&path)
+            measurement_kind(&path).unwrap_or(Kind::Other)
         } else {
-            None
+            Kind::Other
         };
-        if let Some(kind) = kind {
+        if !restricted || kind != Kind::Other {
             entries.push(Entry {
                 path,
                 label: terminal_text(Path::new(&entry.file_name())),
