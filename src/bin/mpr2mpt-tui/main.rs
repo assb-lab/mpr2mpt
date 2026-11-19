@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use browser::{Browser, Entry, Kind};
 use clap::Parser;
+use clipboard::PathPart;
 use crossterm::cursor::Show;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -162,7 +163,8 @@ struct Prompt {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Prefix {
     Jump,
-    Copy,
+    Yank,
+    CopyPath,
 }
 
 struct App {
@@ -258,11 +260,11 @@ impl App {
                     self.parent();
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') => self.open_selection(false),
+            KeyCode::Right | KeyCode::Char('l') => self.open_selection(),
             KeyCode::Enter if key.kind == KeyEventKind::Press && self.show_report => {
                 self.open_result();
             }
-            KeyCode::Enter if key.kind == KeyEventKind::Press => self.open_selection(true),
+            KeyCode::Enter if key.kind == KeyEventKind::Press => self.open_selection(),
             KeyCode::Down | KeyCode::Char('j') => self.walk(1),
             KeyCode::Up | KeyCode::Char('k') => self.walk(-1),
             KeyCode::Char('J') => self.move_metadata(1),
@@ -271,13 +273,18 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.walk(isize::MAX),
             KeyCode::Char(' ') if key.kind == KeyEventKind::Press => self.toggle_mark(),
             KeyCode::Char('x') => self.marked.clear(),
-            KeyCode::Char('c') if key.kind == KeyEventKind::Press => self.start_conversion(),
+            KeyCode::Char('e') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+                self.start_conversion()
+            }
+            KeyCode::Char('c') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+                self.prefix = Some(Prefix::CopyPath)
+            }
             KeyCode::Char('v') if key.kind == KeyEventKind::Press => self.toggle_inspection(),
             KeyCode::Char('g') if key.kind == KeyEventKind::Press => {
                 self.prefix = Some(Prefix::Jump)
             }
             KeyCode::Char('y') if key.kind == KeyEventKind::Press => {
-                self.prefix = Some(Prefix::Copy)
+                self.prefix = Some(Prefix::Yank)
             }
             KeyCode::Char('p') if key.kind == KeyEventKind::Press => self.paste_files(),
             KeyCode::Char('.') if key.kind == KeyEventKind::Press => {
@@ -334,15 +341,19 @@ impl App {
             return true;
         }
         if !key.modifiers.is_empty() {
-            return false;
+            return prefix == Prefix::CopyPath;
         }
         match prefix {
             Prefix::Jump => self.jump(key.code),
-            Prefix::Copy if key.code == KeyCode::Char('y') => {
+            Prefix::Yank if key.code == KeyCode::Char('y') => {
                 self.yank();
                 true
             }
-            Prefix::Copy => false,
+            Prefix::Yank => false,
+            Prefix::CopyPath => {
+                self.copy_path(key.code);
+                true
+            }
         }
     }
 
@@ -366,6 +377,24 @@ impl App {
             Err(error) => self.show_error(error),
         }
         true
+    }
+
+    fn copy_path(&mut self, key: KeyCode) {
+        let part = match key {
+            KeyCode::Char('c') => PathPart::Absolute,
+            KeyCode::Char('d') => PathPart::Parent,
+            KeyCode::Char('f') => PathPart::Name,
+            KeyCode::Char('n') => PathPart::Stem,
+            _ => return,
+        };
+        let Some(entry) = self.browser.selected() else {
+            self.message = Some("Select an item to copy its path.".into());
+            return;
+        };
+        match part.text(&entry.path).and_then(clipboard::copy_text) {
+            Ok(()) => self.message = Some("Copied to system clipboard.".into()),
+            Err(error) => self.show_error(error),
+        }
     }
 
     fn yank(&mut self) {
@@ -430,7 +459,9 @@ impl App {
 
     fn confirm_trash(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('y') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+            KeyCode::Char('y') | KeyCode::Enter
+                if key.kind == KeyEventKind::Press && key.modifiers.is_empty() =>
+            {
                 let Some(target) = self.trash_target.take() else {
                     return;
                 };
@@ -459,11 +490,10 @@ impl App {
         }
     }
 
-    fn open_selection(&mut self, convert_mpr: bool) {
+    fn open_selection(&mut self) {
         match self.browser.selected() {
             Some(entry) if entry.kind == Kind::Directory => self.open_path(entry.path.clone()),
-            Some(entry) if convert_mpr && entry.kind == Kind::Mpr => self.start_conversion(),
-            Some(entry) if !convert_mpr => {
+            Some(entry) => {
                 if entry.kind == Kind::Mpr && !matches!(self.detail, Detail::Inspection(_)) {
                     self.open_inspection();
                 }
@@ -475,8 +505,7 @@ impl App {
                     self.show_report = false;
                 }
             }
-            Some(entry) if entry.kind == Kind::Mpt => self.show_report = false,
-            _ => {}
+            None => {}
         }
     }
 
@@ -1085,6 +1114,26 @@ mod navigation_tests {
     }
 
     #[test]
+    fn e_requests_conversion_confirmation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("sample.mpr");
+        let output = source.with_extension("mpt");
+        fs::write(&source, []).unwrap();
+        fs::write(&output, b"existing").unwrap();
+        let mut app = app_at(&source);
+
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pending_overwrite.is_none());
+        app.key(key('c'));
+        assert!(app.pending_overwrite.is_none());
+        assert!(app.prefix.is_some());
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.key(key('e'));
+        assert!(app.pending_overwrite.is_some());
+        assert_eq!(fs::read(output).unwrap(), b"existing");
+    }
+
+    #[test]
     fn cancelling_trash_keeps_the_highlighted_file() {
         let scratch = tempfile::tempdir().unwrap();
         let path = scratch.path().join("sample.mpr");
@@ -1108,15 +1157,18 @@ mod navigation_tests {
     #[cfg(unix)]
     #[test]
     fn refuses_to_trash_a_file_replaced_during_confirmation() {
-        let scratch = tempfile::tempdir().unwrap();
-        let path = scratch.path().join("sample.mpr");
-        fs::write(&path, b"original").unwrap();
-        let mut app = app_at(scratch.path());
-        app.key(key('d'));
-        fs::rename(&path, scratch.path().join("original.mpr")).unwrap();
-        fs::write(&path, b"replacement").unwrap();
-        app.key(key('y'));
-        assert_eq!(fs::read(path).unwrap(), b"replacement");
-        assert!(app.message.unwrap().contains("changed"));
+        for confirm in [key('y'), KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)] {
+            let scratch = tempfile::tempdir().unwrap();
+            let path = scratch.path().join("sample.mpr");
+            fs::write(&path, b"original").unwrap();
+            let mut app = app_at(scratch.path());
+            app.key(key('d'));
+            fs::rename(&path, scratch.path().join("original.mpr")).unwrap();
+            fs::write(&path, b"replacement").unwrap();
+            app.key(confirm);
+            assert!(app.trash_target.is_none());
+            assert_eq!(fs::read(path).unwrap(), b"replacement");
+            assert!(app.message.unwrap().contains("changed"));
+        }
     }
 }

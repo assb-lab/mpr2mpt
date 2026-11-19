@@ -1,6 +1,91 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub(super) enum PathPart {
+    Absolute,
+    Parent,
+    Name,
+    Stem,
+}
+
+impl PathPart {
+    pub(super) fn text(self, path: &Path) -> io::Result<&str> {
+        let part = match self {
+            Self::Absolute => Some(path.as_os_str()),
+            Self::Parent => path.parent().map(Path::as_os_str),
+            Self::Name => path.file_name(),
+            Self::Stem => path.file_stem(),
+        };
+        part.and_then(std::ffi::OsStr::to_str).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "The selected path cannot be copied as UTF-8 text",
+            )
+        })
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn copy_text(text: &str) -> io::Result<()> {
+    use std::process::Command;
+
+    #[cfg(target_os = "macos")]
+    {
+        write_clipboard(Command::new("pbcopy").env("LC_ALL", "en_US.UTF-8"), text)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            let result = write_clipboard(
+                Command::new("wl-copy").args(["--type", "text/plain;charset=utf-8"]),
+                text,
+            );
+            if result.is_ok() || std::env::var_os("DISPLAY").is_none() {
+                return result;
+            }
+        }
+        write_clipboard(
+            Command::new("xclip").args(["-selection", "clipboard", "-in"]),
+            text,
+        )
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_clipboard(command: &mut std::process::Command, text: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let program = command.get_program().to_string_lossy().into_owned();
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            io::Error::new(error.kind(), format!("Cannot start {program}: {error}"))
+        })?;
+    let written = child
+        .stdin
+        .take()
+        .expect("clipboard command has piped stdin")
+        .write_all(text.as_bytes());
+    let status = child.wait()?;
+    if status.success() {
+        written
+    } else {
+        Err(io::Error::other(format!("{program} exited with {status}")))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(super) fn copy_text(_: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "System clipboard is unavailable on this platform",
+    ))
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn copy_into(source: &Path, destination_directory: &Path) -> io::Result<PathBuf> {
     use rustix::fs::{CWD, Mode, OFlags, RenameFlags, openat, renameat_with};

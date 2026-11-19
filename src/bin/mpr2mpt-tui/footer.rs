@@ -6,7 +6,6 @@ use ratatui::widgets::Paragraph;
 
 use super::{App, Detail, Prefix};
 
-const BAR: Color = Color::Rgb(37, 53, 73);
 const GUIDE: Color = Color::Rgb(23, 33, 49);
 const KEY: Color = Color::Rgb(50, 69, 94);
 const LABEL: Color = Color::Rgb(222, 232, 244);
@@ -16,7 +15,8 @@ const INK: Color = Color::Rgb(16, 32, 51);
 const NORMAL: &[(&str, &str)] = &[
     ("j/k", "Move"),
     ("h/l", "Back/Open"),
-    ("c", "Convert"),
+    ("e", "Convert"),
+    ("c…", "Copy path"),
     ("v", "Preview"),
     ("q/Q", "Quit/cd"),
     ("g…", "Jump"),
@@ -43,7 +43,7 @@ pub(super) fn shortcuts(app: &App, width: u16) -> Vec<Line<'static>> {
             ("j/k", "Outputs"),
         ]
     } else if app.trash_target.is_some() {
-        &[("y", "Confirm"), ("n / Esc", "Cancel")]
+        &[("y / Enter", "Confirm"), ("n / Esc", "Cancel")]
     } else if app.prefix == Some(Prefix::Jump) {
         &[
             ("Space", "Path"),
@@ -52,8 +52,16 @@ pub(super) fn shortcuts(app: &App, width: u16) -> Vec<Line<'static>> {
             ("h", "Home"),
             ("t", "Trash"),
         ]
-    } else if app.prefix == Some(Prefix::Copy) {
+    } else if app.prefix == Some(Prefix::Yank) {
         &[("y", "Copy"), ("Esc", "Cancel")]
+    } else if app.prefix == Some(Prefix::CopyPath) {
+        &[
+            ("c", "Absolute"),
+            ("d", "Parent"),
+            ("f", "Name"),
+            ("n", "Stem"),
+            ("Esc", "Cancel"),
+        ]
     } else if app.prompt.is_some() {
         &[("Enter", "Apply"), ("Esc", "Back"), ("Ctrl+U", "Clear")]
     } else if app.preview_focused && matches!(app.detail, Detail::Inspection(_)) {
@@ -64,7 +72,7 @@ pub(super) fn shortcuts(app: &App, width: u16) -> Vec<Line<'static>> {
             ("J/K", "Metadata"),
             ("[ ]", "Cols"),
             ("v", "Close"),
-            ("c", "Convert"),
+            ("e", "Convert"),
         ]
     } else if app.preview_focused {
         &[
@@ -145,10 +153,7 @@ pub(super) fn draw_status(app: &App, frame: &mut Frame, area: Rect) {
     if let Some((message, color)) = note {
         lines.push(Line::from(format!(" {message}")).fg(color));
     }
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::new().fg(LABEL).bg(BAR)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).style(Style::new().fg(LABEL)), area);
 }
 
 fn report_status(
@@ -226,5 +231,27 @@ mod tests {
         assert!(text.contains("2 failed"));
         assert!(text.contains("12/12"));
         assert!(line.width() <= 27);
+    }
+
+    #[test]
+    fn status_keeps_its_badge_and_uses_the_terminal_background() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut app = App::new(crate::Args {
+            input: Some(folder.path().into()),
+            output: None,
+            plain_icons: true,
+            cwd_file: None,
+        })
+        .unwrap();
+        app.message = Some("Copied file name.".into());
+        let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
+        terminal
+            .draw(|frame| draw_status(&app, frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].bg, AQUA);
+        assert_eq!(buffer[(39, 0)].bg, Color::Reset);
+        assert_eq!(buffer[(1, 1)].bg, Color::Reset);
+        assert_eq!(buffer[(39, 1)].bg, Color::Reset);
     }
 }
