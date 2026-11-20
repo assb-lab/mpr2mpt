@@ -58,6 +58,18 @@ pub fn convert(input: &Path, output: Option<&Path>) -> Result<ConversionReport, 
     convert_with_approval(input, output, None, &[])
 }
 
+pub(crate) fn has_invalid_output_name(output: &Path) -> bool {
+    if output.file_name().is_none() {
+        return true;
+    }
+    let bytes = output.as_os_str().as_encoded_bytes();
+    bytes
+        .strip_suffix(b".")
+        .unwrap_or(bytes)
+        .last()
+        .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
+}
+
 fn convert_with_approval(
     input: &Path,
     output: Option<&Path>,
@@ -65,7 +77,7 @@ fn convert_with_approval(
     protected: &[PathBuf],
 ) -> Result<ConversionReport, ConversionError> {
     let output = output.map_or_else(|| input.with_extension("mpt"), Path::to_path_buf);
-    if output.file_name().is_none() {
+    if has_invalid_output_name(&output) {
         return Err(ConversionError::OutputName(output));
     }
     let output_error = |source: io::Error| {

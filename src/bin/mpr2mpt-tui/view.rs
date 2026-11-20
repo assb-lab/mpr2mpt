@@ -216,8 +216,7 @@ impl App {
                     Detail::Mpr { path, bytes } => {
                         let size = format!("{:.1} KiB", *bytes as f64 / 1024.0);
                         let planned = self
-                            .output
-                            .clone()
+                            .planned_output(path)
                             .unwrap_or_else(|| path.with_extension("mpt"));
                         let lines = vec![
                             Line::from("BioLogic MPR").fg(ACCENT).bold(),
