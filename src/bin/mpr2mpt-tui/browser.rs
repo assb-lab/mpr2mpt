@@ -204,10 +204,7 @@ fn measurement_kind(path: &Path) -> Option<Kind> {
 }
 
 pub(super) fn terminal_text(path: &Path) -> String {
-    path.to_string_lossy()
-        .chars()
-        .map(|ch| if ch.is_control() { '�' } else { ch })
-        .collect()
+    super::safe_text(&path.to_string_lossy())
 }
 
 fn is_hidden(path: &Path) -> bool {

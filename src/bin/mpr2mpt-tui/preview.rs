@@ -396,17 +396,7 @@ fn invalid_header(message: &'static str) -> io::Error {
 }
 
 fn cell_text(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                '�'
-            } else {
-                character
-            }
-        })
-        .collect()
+    super::safe_text(value.trim())
 }
 
 #[cfg(test)]

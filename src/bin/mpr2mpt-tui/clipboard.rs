@@ -31,7 +31,10 @@ pub(super) fn copy_text(text: &str) -> io::Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        write_clipboard(Command::new("pbcopy").env("LC_ALL", "en_US.UTF-8"), text)
+        write_clipboard(
+            Command::new("/usr/bin/pbcopy").env("LC_ALL", "en_US.UTF-8"),
+            text,
+        )
     }
     #[cfg(target_os = "linux")]
     {
@@ -127,7 +130,12 @@ pub(super) fn copy_into(source: &Path, destination_directory: &Path) -> io::Resu
         .prefix(".mpr2mpt-copy-")
         .permissions(Permissions::from_mode(0o700))
         .tempdir_in(&directory)?;
-    let staging_file = File::open(staging.path())?;
+    let staging_file = File::from(openat(
+        CWD,
+        staging.path(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
     let staging_metadata = staging_file.metadata()?;
     ancestors.push((staging_metadata.dev(), staging_metadata.ino()));
     let mut directory_permissions = Vec::new();

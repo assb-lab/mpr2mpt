@@ -69,6 +69,82 @@ impl OverwriteApproval {
         &self.path
     }
 
+    /// Recheck and publish `temporary` onto the approved destination.
+    /// On Unix, revalidates and renames inside the verified parent directory descriptor
+    /// to prevent parent-directory symlink redirection between validation and publish.
+    pub(crate) fn publish_temp(
+        &self,
+        temporary: tempfile::NamedTempFile,
+        output: &Path,
+        inputs: &[PathBuf],
+    ) -> Result<(), ConversionError> {
+        self.validate(output, inputs)?;
+        #[cfg(unix)]
+        {
+            use rustix::fs::{CWD, Mode, OFlags, openat, renameat};
+
+            let name = self
+                .path
+                .file_name()
+                .ok_or_else(|| ConversionError::OutputName(self.path.clone()))?;
+            let parent_fd = File::from(
+                openat(
+                    CWD,
+                    &self.parent.canonical,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|source| output_error(&self.path, source.into()))?,
+            );
+            let parent_meta = parent_fd
+                .metadata()
+                .map_err(|source| output_error(&self.path, source))?;
+            if (parent_meta.dev(), parent_meta.ino()) != self.parent.identity {
+                return Err(ConversionError::OverwriteChanged(self.path.clone()));
+            }
+            let target_file = match openat(
+                &parent_fd,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => File::from(fd),
+                Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => {
+                    return Err(ConversionError::OverwriteChanged(self.path.clone()));
+                }
+                Err(source) => return Err(output_error(&self.path, source.into())),
+            };
+            let target_meta = target_file
+                .metadata()
+                .map_err(|source| output_error(&self.path, source))?;
+            if !target_meta.is_file() || self.snapshot != Snapshot::new(&target_meta) {
+                return Err(ConversionError::OverwriteChanged(self.path.clone()));
+            }
+            if is_input_alias(&self.path, &target_meta, inputs) {
+                return Err(ConversionError::OverwriteProtected(self.path.clone()));
+            }
+            drop(target_file);
+
+            // Note: POSIX renameat cannot atomically assert the target inode, so a
+            // narrow same-directory race remains between target_file validation and renameat.
+            let temp_path = temporary.into_temp_path();
+            let temp_name = temp_path
+                .file_name()
+                .ok_or_else(|| ConversionError::OutputName(self.path.clone()))?;
+            renameat(&parent_fd, temp_name, &parent_fd, name)
+                .map_err(|source| output_error(&self.path, source.into()))?;
+            let _ = temp_path.keep();
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            temporary
+                .persist(output)
+                .map_err(|error| output_error(output, error.error))?;
+            Ok(())
+        }
+    }
+
     /// Recheck immediately before publication so stale approvals are rejected.
     pub(crate) fn validate(
         &self,
