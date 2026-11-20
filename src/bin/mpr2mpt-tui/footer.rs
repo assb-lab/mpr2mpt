@@ -70,6 +70,15 @@ pub(super) fn shortcuts(app: &App, width: u16) -> Vec<Line<'static>> {
         &[("Enter", "Convert"), ("Esc", "Cancel"), ("Ctrl+U", "Clear")]
     } else if app.prompt.is_some() {
         &[("Enter", "Apply"), ("Esc", "Back"), ("Ctrl+U", "Clear")]
+    } else if app.show_report && app.report.is_some() {
+        &[
+            ("Tab / Esc", "Preview"),
+            ("PgUp/Dn", "Select"),
+            ("Enter", "Open MPT"),
+            ("o", "Default app"),
+            ("j/k", "Files"),
+            ("q/Q", "Quit/cd"),
+        ]
     } else if app.preview_focused && matches!(app.detail, Detail::Inspection(_)) {
         &[
             ("h / Esc", "Files"),
@@ -147,11 +156,15 @@ pub(super) fn draw_status(app: &App, frame: &mut Frame, area: Rect) {
     };
     let note = if app.exit_when_done {
         Some((
-            "Exiting after the active conversion…".to_owned(),
+            "Exiting after active background work…".to_owned(),
             Color::LightYellow,
         ))
     } else if let Some(message) = &app.message {
         Some((message.clone(), Color::LightYellow))
+    } else if app.pasting.is_some() {
+        Some(("Pasting files…".to_owned(), AQUA))
+    } else if app.inspecting.is_some() {
+        Some(("Loading MPR preview…".to_owned(), AQUA))
     } else if !app.browser.filter.is_empty() {
         Some((format!("Filter: {}", app.browser.filter), AQUA))
     } else {

@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 
 use mpr2mpt::batch::{BatchJob, BatchOutcome, convert_batch_with_approvals, preflight_destinations};
 use mpr2mpt::overwrite::OverwriteApproval;
-use mpr2mpt::{ConversionError, ConversionReport};
+use mpr2mpt::{ConversionError, ConversionReport, Inspection};
 
 pub(super) enum BatchMessage {
     Outcome(BatchOutcome),
@@ -110,6 +110,85 @@ impl Report {
             results,
             cursor: 0,
             failure: None,
+        }
+    }
+}
+
+pub(super) struct RunningInspection {
+    pub(super) path: PathBuf,
+    pub(super) focus_when_done: bool,
+    pub(super) receiver: Receiver<Result<Inspection, ConversionError>>,
+}
+
+impl RunningInspection {
+    pub(super) fn start(path: PathBuf, focus_when_done: bool) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let target = path.clone();
+        // Detach the read-only inspection thread so replacing or quitting never blocks.
+        thread::Builder::new()
+            .name("mpr2mpt-inspect".into())
+            .spawn(move || {
+                let _ = sender.send(mpr2mpt::inspect(&target));
+            })?;
+        Ok(Self {
+            path,
+            focus_when_done,
+            receiver,
+        })
+    }
+}
+
+pub(super) struct PasteSummary {
+    pub(super) copied: usize,
+    pub(super) failed: usize,
+    pub(super) first_failure: Option<String>,
+}
+
+pub(super) struct RunningPaste {
+    pub(super) receiver: Receiver<PasteSummary>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl RunningPaste {
+    pub(super) fn start(sources: Vec<PathBuf>, destination: PathBuf) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("mpr2mpt-paste".into())
+            .spawn(move || {
+                let mut copied = 0;
+                let mut first_failure = None;
+                let total = sources.len();
+                for source in &sources {
+                    match super::clipboard::copy_into(source, &destination) {
+                        Ok(_) => copied += 1,
+                        Err(error) => {
+                            first_failure.get_or_insert_with(|| {
+                                format!(
+                                    "{}: {}",
+                                    super::browser::terminal_text(source),
+                                    super::safe_text(&error.to_string())
+                                )
+                            });
+                        }
+                    }
+                }
+                let _ = sender.send(PasteSummary {
+                    copied,
+                    failed: total - copied,
+                    first_failure,
+                });
+            })?;
+        Ok(Self {
+            receiver,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for RunningPaste {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
