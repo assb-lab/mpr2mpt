@@ -26,7 +26,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use jobs::{BatchMessage, PendingOverwrite, Report, RunningBatch};
+use jobs::{
+    BatchMessage, PendingOverwrite, Report, RunningBatch, RunningInspection, RunningPaste,
+};
 use mpr2mpt::batch::BatchJob;
 use mpr2mpt::overwrite::OverwriteApproval;
 use path_field::PathField;
@@ -71,6 +73,9 @@ fn run(args: Args) -> io::Result<()> {
         ));
     }
     let cwd_file = args.cwd_file.clone();
+    if let Some(destination) = cwd_file.as_deref() {
+        validate_cwd_file(destination)?;
+    }
     let mut app = App::new(args)?;
     run_terminal(&mut app)?;
     if let Some(directory) = app.exit_directory {
@@ -81,6 +86,36 @@ fn run(args: Args) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_cwd_file(destination: &Path) -> io::Result<()> {
+    if destination.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid --cwd-file path: {}", destination.display()),
+        ));
+    }
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Parent directory for --cwd-file does not exist: {}",
+                parent.display()
+            ),
+        ));
+    }
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("--cwd-file already exists: {}", destination.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn write_exit_directory(destination: &Path, directory: &Path) -> io::Result<()> {
@@ -104,13 +139,11 @@ fn run_terminal(app: &mut App) -> io::Result<()> {
     loop {
         app.receive_results();
         app.poll_launchers();
-        if app.exit_when_done && app.running.is_none() {
+        if app.exit_when_done && app.running.is_none() && app.pasting.is_none() {
             return Ok(());
         }
         terminal.draw(|frame| app.draw(frame))?;
-        if (app.running.is_some() || !app.launchers.is_empty())
-            && !event::poll(Duration::from_millis(75))?
-        {
+        if app.has_background_work() && !event::poll(Duration::from_millis(75))? {
             continue;
         }
         match event::read()? {
@@ -141,6 +174,7 @@ impl Drop for TerminalSession {
 
 enum Detail {
     Empty,
+    Binary { bytes: u64 },
     Mpr { path: PathBuf, bytes: u64 },
     Inspection(InspectionView),
     Mpt(MptPreview),
@@ -190,6 +224,8 @@ struct App {
     report: Option<Report>,
     show_report: bool,
     running: Option<RunningBatch>,
+    inspecting: Option<RunningInspection>,
+    pasting: Option<RunningPaste>,
     launchers: Vec<(Child, Instant)>,
     exit_when_done: bool,
     exit_directory: Option<PathBuf>,
@@ -197,6 +233,8 @@ struct App {
 }
 
 const LAUNCHER_WATCH_TIMEOUT: Duration = Duration::from_secs(3);
+const PAGE_STEP: isize = 10;
+const TEXT_HORIZONTAL_STEP: isize = 8;
 
 impl App {
     fn new(args: Args) -> io::Result<Self> {
@@ -237,6 +275,8 @@ impl App {
             report: None,
             show_report: false,
             running: None,
+            inspecting: None,
+            pasting: None,
             launchers: Vec::new(),
             exit_when_done: false,
             exit_directory: None,
@@ -244,6 +284,13 @@ impl App {
         };
         app.update_detail();
         Ok(app)
+    }
+
+    fn has_background_work(&self) -> bool {
+        self.running.is_some()
+            || self.inspecting.is_some()
+            || self.pasting.is_some()
+            || !self.launchers.is_empty()
     }
 
     fn planned_output(&self, input: &Path) -> Option<PathBuf> {
@@ -282,11 +329,11 @@ impl App {
         }
         match key.code {
             KeyCode::Esc if self.preview_focused => self.preview_focused = false,
-            KeyCode::Esc if !self.show_report && matches!(self.detail, Detail::Inspection(_)) => {
-                self.update_detail()
-            }
+            KeyCode::Esc if self.show_report => self.show_report = false,
+            KeyCode::Esc if matches!(self.detail, Detail::Inspection(_)) => self.update_detail(),
             KeyCode::Esc if !self.browser.filter.is_empty() => self.set_filter(String::new()),
-            KeyCode::Esc | KeyCode::Char('q') => return self.quit(),
+            KeyCode::Esc => {}
+            KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('Q') => {
                 self.exit_directory = Some(self.browser.directory.clone());
                 return self.quit();
@@ -358,17 +405,37 @@ impl App {
                 self.preview_focused = false;
                 self.show_report = !self.show_report;
             }
-            KeyCode::PageUp => self.move_details(-1, 0),
-            KeyCode::PageDown => self.move_details(1, 0),
-            KeyCode::Char('[') => self.move_details(0, -1),
-            KeyCode::Char(']') => self.move_details(0, 1),
+            KeyCode::PageUp => {
+                let step = if self.show_report { -1 } else { -PAGE_STEP };
+                self.move_details(step, 0);
+            }
+            KeyCode::PageDown => {
+                let step = if self.show_report { 1 } else { PAGE_STEP };
+                self.move_details(step, 0);
+            }
+            KeyCode::Char('[') => {
+                let step = if matches!(self.detail, Detail::Text(_)) {
+                    -TEXT_HORIZONTAL_STEP
+                } else {
+                    -1
+                };
+                self.move_details(0, step);
+            }
+            KeyCode::Char(']') => {
+                let step = if matches!(self.detail, Detail::Text(_)) {
+                    TEXT_HORIZONTAL_STEP
+                } else {
+                    1
+                };
+                self.move_details(0, step);
+            }
             _ => {}
         }
         false
     }
 
     fn quit(&mut self) -> bool {
-        self.exit_when_done = self.running.is_some();
+        self.exit_when_done = self.running.is_some() || self.pasting.is_some();
         !self.exit_when_done
     }
 
@@ -463,39 +530,31 @@ impl App {
     }
 
     fn paste_files(&mut self) {
+        if self.pasting.is_some() {
+            self.message = Some("Wait for the active paste before starting another.".into());
+            return;
+        }
+        if self.running.is_some() {
+            self.message = Some("Wait for the active conversion before pasting files.".into());
+            return;
+        }
         if self.clipboard.is_empty() {
             self.message = Some("Use yy to copy an item first.".into());
             return;
         }
-        let mut copied = 0;
-        let mut first_failure = None;
-        for source in &self.clipboard {
-            match clipboard::copy_into(source, &self.browser.directory) {
-                Ok(_) => copied += 1,
-                Err(error) => {
-                    first_failure.get_or_insert_with(|| {
-                        format!(
-                            "{}: {}",
-                            browser::terminal_text(source),
-                            safe_text(&error.to_string())
-                        )
-                    });
-                }
+        match RunningPaste::start(self.clipboard.clone(), self.browser.directory.clone()) {
+            Ok(worker) => {
+                self.pasting = Some(worker);
+                self.show_report = false;
             }
+            Err(error) => self.show_error(error),
         }
-        let failed = self.clipboard.len() - copied;
-        self.message = Some(match first_failure {
-            Some(reason) => format!("{copied} pasted, {failed} failed. {reason}"),
-            None => format!("{copied} item(s) pasted."),
-        });
-        self.show_report = false;
-        self.reload();
     }
 
     fn request_trash(&mut self) {
-        if self.running.is_some() {
+        if self.running.is_some() || self.pasting.is_some() {
             self.message =
-                Some("Wait for the active conversion before moving files to Trash.".into());
+                Some("Wait for active background work before moving files to Trash.".into());
         } else if let Some(entry) = self.browser.selected() {
             if entry.path == self.browser.directory {
                 self.message = Some("Select a file or child folder to move to Trash.".into());
@@ -550,7 +609,8 @@ impl App {
             }
             Some(entry) => {
                 if entry.kind == Kind::Mpr && !matches!(self.detail, Detail::Inspection(_)) {
-                    self.open_inspection();
+                    self.open_inspection(true);
+                    return;
                 }
                 if matches!(
                     self.detail,
@@ -697,13 +757,8 @@ impl App {
                 self.detail = Detail::Inspection(previous);
                 self.preview_focused = was_focused;
                 self.restore_preview_position(row, column);
-            } else if let Ok(inspection) = mpr2mpt::inspect(&entry.path) {
-                let mut view = InspectionView::from(inspection);
-                view.source_meta = current_sig;
-                view.metadata_start = shift(previous.metadata_start, 0, view.metadata.len());
-                self.detail = Detail::Inspection(view);
-                self.preview_focused = was_focused;
-                self.restore_preview_position(row, column);
+            } else if let Ok(worker) = RunningInspection::start(entry.path.clone(), was_focused) {
+                self.inspecting = Some(worker);
             }
         } else if was_focused
             && still_selected.is_some()
@@ -752,7 +807,12 @@ impl App {
                 },
                 Kind::Mps | Kind::Other => match TextPreview::load(&entry.path) {
                     Ok(Some(preview)) => Detail::Text(preview),
-                    Ok(None) => Detail::Empty,
+                    Ok(None) => match entry.path.metadata() {
+                        Ok(metadata) if metadata.is_file() => Detail::Binary {
+                            bytes: metadata.len(),
+                        },
+                        _ => Detail::Empty,
+                    },
                     Err(error) => Detail::Error(error.to_string()),
                 },
             },
@@ -842,7 +902,10 @@ impl App {
                 let value = &prompt.field.value;
                 match prompt.kind {
                     PromptKind::Path if !value.is_empty() => {
-                        self.open_path(self.browser.directory.join(value));
+                        match expand_jump_path(&self.browser.directory, value) {
+                            Ok(path) => self.open_path(path),
+                            Err(error) => self.show_error(error),
+                        }
                     }
                     PromptKind::Output { input } => {
                         let output = (!value.is_empty()).then(|| input.with_file_name(value));
@@ -863,8 +926,8 @@ impl App {
     }
 
     fn prompt_named_conversion(&mut self) {
-        if self.running.is_some() {
-            self.message = Some("Wait for the active conversion before starting another.".into());
+        if self.running.is_some() || self.pasting.is_some() {
+            self.message = Some("Wait for active background work before starting another.".into());
             return;
         }
         if let Some(entry) = self
@@ -881,7 +944,8 @@ impl App {
     }
 
     fn start_conversion(&mut self) {
-        if self.running.is_some() {
+        if self.running.is_some() || self.pasting.is_some() {
+            self.message = Some("Wait for active background work before starting a conversion.".into());
             return;
         }
         let mut checked: Vec<_> = self.marked.iter().cloned().collect();
@@ -972,11 +1036,11 @@ impl App {
                 self.update_detail();
             }
         } else {
-            self.open_inspection();
+            self.open_inspection(false);
         }
     }
 
-    fn open_inspection(&mut self) {
+    fn open_inspection(&mut self, focus_when_done: bool) {
         if self.running.is_some() {
             self.message = Some("Wait for the active conversion before opening a preview.".into());
             return;
@@ -989,15 +1053,8 @@ impl App {
             self.message = Some("Select an MPR to preview.".into());
             return;
         };
-        match mpr2mpt::inspect(&entry.path) {
-            Ok(inspection) => {
-                let mut view = InspectionView::from(inspection);
-                view.source_meta = preview::file_signature(&entry.path);
-                self.detail = Detail::Inspection(view);
-                self.show_report = false;
-                self.preview_column = 0;
-                self.preview_row = 0;
-            }
+        match RunningInspection::start(entry.path.clone(), focus_when_done) {
+            Ok(worker) => self.inspecting = Some(worker),
             Err(error) => self.show_error(error),
         }
     }
@@ -1041,6 +1098,62 @@ impl App {
                 }
             }
         }
+        if let Some(inspecting) = &self.inspecting {
+            match inspecting.receiver.try_recv() {
+                Ok(result) => {
+                    let completed = self.inspecting.take().expect("inspecting is present");
+                    let still_selected = self
+                        .browser
+                        .selected()
+                        .is_some_and(|entry| entry.path == completed.path);
+                    if still_selected {
+                        match result {
+                            Ok(inspection) => {
+                                let mut view = InspectionView::from(inspection);
+                                view.source_meta = preview::file_signature(&completed.path);
+                                self.detail = Detail::Inspection(view);
+                                self.preview_column = 0;
+                                self.preview_row = 0;
+                                if self.running.is_none()
+                                    && !self.show_report
+                                    && completed.focus_when_done
+                                {
+                                    self.preview_focused = true;
+                                }
+                            }
+                            Err(error) => self.show_error(error),
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    drop(self.inspecting.take());
+                    self.show_error("The preview worker stopped before reporting a result.");
+                }
+            }
+        }
+        if let Some(pasting) = &self.pasting {
+            match pasting.receiver.try_recv() {
+                Ok(summary) => {
+                    drop(self.pasting.take());
+                    self.message = Some(match summary.first_failure {
+                        Some(reason) => format!(
+                            "{} pasted, {} failed. {reason}",
+                            summary.copied, summary.failed
+                        ),
+                        None => format!("{} item(s) pasted.", summary.copied),
+                    });
+                    self.show_report = false;
+                    self.reload();
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    drop(self.pasting.take());
+                    self.show_error("The paste worker stopped before reporting a result.");
+                    self.reload();
+                }
+            }
+        }
     }
 
     fn fail_batch(&mut self, error: &str) {
@@ -1068,6 +1181,16 @@ impl App {
 
     fn show_error(&mut self, error: impl std::fmt::Display) {
         self.message = Some(safe_text(&error.to_string()));
+    }
+}
+
+fn expand_jump_path(base: &Path, input: &str) -> io::Result<PathBuf> {
+    if input == "~" {
+        trash::home()
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        Ok(trash::home()?.join(rest))
+    } else {
+        Ok(base.join(input))
     }
 }
 
@@ -1308,7 +1431,7 @@ mod navigation_tests {
         let path = scratch.path().join("binary.txt");
         fs::write(&path, b"looks like text\n\0\xff\0").unwrap();
         let mut app = app_at(&path);
-        assert!(matches!(app.detail, Detail::Empty));
+        assert!(matches!(app.detail, Detail::Binary { bytes: 19 }));
         app.key(key('l'));
         assert!(!app.preview_focused);
     }
@@ -1368,14 +1491,24 @@ mod navigation_tests {
         let destination = child.join("sample.mpr");
         fs::write(&source, b"source").unwrap();
         let mut app = app_at(&source);
+        let finish_paste = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.pasting.is_some() {
+                assert!(Instant::now() < deadline, "paste worker timed out");
+                app.receive_results();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
         app.key(key('y'));
         app.key(key('y'));
         app.key(key('k'));
         app.key(key('l'));
         app.key(key('p'));
+        finish_paste(&mut app);
         assert_eq!(fs::read(&destination).unwrap(), b"source");
         fs::write(&destination, b"other").unwrap();
         app.key(key('p'));
+        finish_paste(&mut app);
         assert_eq!(fs::read(&destination).unwrap(), b"other");
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert!(app.prompt.is_none());
@@ -1567,5 +1700,95 @@ mod navigation_tests {
             browser::terminal_text(Path::new(spoofed)),
             "report\u{fffd}tpm\u{fffd}.mpr"
         );
+    }
+
+    #[test]
+    fn esc_dismisses_report_and_does_not_quit() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = app_at(scratch.path());
+        app.show_report = true;
+        assert!(!app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!app.show_report);
+        assert!(!app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn page_and_text_horizontal_scroll_use_larger_steps() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("notes.txt");
+        let content: String = (0..30)
+            .map(|i| format!("line-{i:02}-{}\n", "x".repeat(40)))
+            .collect();
+        fs::write(&path, content).unwrap();
+        let mut app = app_at(&path);
+        app.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.preview_row, PAGE_STEP as usize);
+        app.key(key(']'));
+        assert_eq!(app.preview_column, TEXT_HORIZONTAL_STEP as usize);
+        app.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.preview_row, 0);
+        app.key(key('['));
+        assert_eq!(app.preview_column, 0);
+    }
+
+    #[test]
+    fn validate_cwd_file_rejects_existing_or_missing_parent() {
+        let scratch = tempfile::tempdir().unwrap();
+        let existing = scratch.path().join("cwd");
+        fs::write(&existing, b"").unwrap();
+        assert_eq!(
+            validate_cwd_file(&existing).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let missing_parent = scratch.path().join("missing/cwd");
+        assert_eq!(
+            validate_cwd_file(&missing_parent).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let valid = scratch.path().join("fresh-cwd");
+        validate_cwd_file(&valid).unwrap();
+    }
+
+    #[test]
+    fn expand_jump_path_expands_tilde_prefix() {
+        let base = Path::new("/tmp");
+        assert_eq!(expand_jump_path(base, "sub").unwrap(), PathBuf::from("/tmp/sub"));
+        if let Ok(home) = trash::home() {
+            assert_eq!(expand_jump_path(base, "~").unwrap(), home);
+            assert_eq!(
+                expand_jump_path(base, "~/Downloads").unwrap(),
+                home.join("Downloads")
+            );
+        }
+    }
+
+    #[test]
+    fn completed_inspection_does_not_dismiss_report_or_steal_focus() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("sample.mpr");
+        fs::write(&path, []).unwrap();
+        let mut app = app_at(&path);
+        let selected = app.browser.selected().unwrap().path.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(mpr2mpt::Inspection {
+                metadata: vec![],
+                headings: vec!["time/s".into()],
+                rows: vec![vec!["0".into()]],
+                total_rows: 1,
+            }))
+            .unwrap();
+        app.inspecting = Some(RunningInspection {
+            path: selected,
+            focus_when_done: true,
+            receiver,
+        });
+        app.show_report = true;
+
+        app.receive_results();
+
+        assert!(app.show_report);
+        assert!(!app.preview_focused);
+        assert!(matches!(app.detail, Detail::Inspection(_)));
     }
 }

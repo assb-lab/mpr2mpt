@@ -214,7 +214,7 @@ impl App {
                             .draw(frame, samples, self.preview_column, self.preview_row);
                     }
                     Detail::Mpr { path, bytes } => {
-                        let size = format!("{:.1} KiB", *bytes as f64 / 1024.0);
+                        let size = format_size(*bytes);
                         let planned = self
                             .planned_output(path)
                             .unwrap_or_else(|| path.with_extension("mpt"));
@@ -233,11 +233,30 @@ impl App {
                             .wrap(Wrap { trim: true }),
                         inner,
                     ),
+                    Detail::Binary { bytes } => {
+                        let size = format_size(*bytes);
+                        let lines = vec![
+                            Line::from("Binary file").fg(ACCENT).bold(),
+                            Line::from(size),
+                            Line::from("Preview unavailable").dark_gray(),
+                        ];
+                        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+                    }
                     Detail::Empty => {}
                     Detail::Folder(_) => unreachable!(),
                 }
             }
         }
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
