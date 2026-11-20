@@ -116,10 +116,7 @@ fn convert_with_approval(
     writer.flush().map_err(output_error)?;
     drop(writer);
     if let Some(approval) = approval {
-        approval.validate(&output, protected)?;
-        temporary
-            .persist(&output)
-            .map_err(|error| output_error(error.error))?;
+        approval.publish_temp(temporary, &output, protected)?;
     } else {
         temporary
             .persist_noclobber(&output)
