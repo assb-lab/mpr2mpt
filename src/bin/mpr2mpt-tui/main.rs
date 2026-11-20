@@ -607,7 +607,7 @@ impl App {
             return;
         };
         let program = if cfg!(target_os = "macos") {
-            "open"
+            "/usr/bin/open"
         } else if cfg!(target_os = "linux") {
             "xdg-open"
         } else {
@@ -1071,10 +1071,30 @@ impl App {
     }
 }
 
+fn is_unsafe_terminal_char(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+                | '\u{E0000}'..='\u{E007F}'
+        )
+}
+
 fn safe_text(value: &str) -> String {
     value
         .chars()
-        .map(|ch| if ch.is_control() { '�' } else { ch })
+        .map(|ch| {
+            if is_unsafe_terminal_char(ch) {
+                '\u{fffd}'
+            } else {
+                ch
+            }
+        })
         .collect()
 }
 
@@ -1537,5 +1557,15 @@ mod navigation_tests {
         assert_eq!(app.preview_row, 2);
         assert_eq!(app.preview_column, 1);
         assert_eq!(app.report.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn sanitizes_bidi_override_characters_in_terminal_text() {
+        let spoofed = "report\u{202e}tpm\u{200b}.mpr";
+        assert_eq!(safe_text(spoofed), "report\u{fffd}tpm\u{fffd}.mpr");
+        assert_eq!(
+            browser::terminal_text(Path::new(spoofed)),
+            "report\u{fffd}tpm\u{fffd}.mpr"
+        );
     }
 }
