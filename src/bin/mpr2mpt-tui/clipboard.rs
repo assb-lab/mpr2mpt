@@ -182,26 +182,30 @@ fn publish_staged(
     name: &std::ffi::OsStr,
     is_directory: bool,
 ) -> io::Result<()> {
-    use rustix::fs::{AtFlags, RenameFlags, linkat, renameat, renameat_with, statat};
+    use rustix::fs::{AtFlags, RenameFlags, linkat, renameat_with};
     use rustix::io::Errno;
 
     match renameat_with(staging, name, destination, name, RenameFlags::NOREPLACE) {
         Ok(()) => Ok(()),
         Err(Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP | Errno::INVAL) => {
             if !is_directory {
-                match linkat(staging, name, destination, name, AtFlags::empty()) {
-                    Ok(()) => return Ok(()),
-                    Err(Errno::PERM | Errno::NOTSUP | Errno::OPNOTSUPP | Errno::NOSYS) => {}
-                    Err(link_err) => return Err(link_err.into()),
-                }
+                return match linkat(staging, name, destination, name, AtFlags::empty()) {
+                    Ok(()) => Ok(()),
+                    Err(Errno::PERM | Errno::NOTSUP | Errno::OPNOTSUPP | Errno::NOSYS) => {
+                        Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "This filesystem does not support atomic no-overwrite copy",
+                        ))
+                    }
+                    Err(link_err) => Err(link_err.into()),
+                };
             }
-            // Fallback for filesystems that support neither RENAME_NOREPLACE nor linkat.
-            // Note: statat -> renameat is not atomic, so a concurrent creator could still race.
-            match statat(destination, name, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(_) => Err(io::ErrorKind::AlreadyExists.into()),
-                Err(Errno::NOENT) => renameat(staging, name, destination, name).map_err(Into::into),
-                Err(stat_err) => Err(stat_err.into()),
-            }
+            // Do not fall back to a non-atomic statat + renameat, which could clobber
+            // a concurrently created destination.
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "This filesystem does not support atomic no-overwrite directory copy",
+            ))
         }
         Err(errno) => Err(errno.into()),
     }
