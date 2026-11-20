@@ -195,6 +195,8 @@ fn publish_staged(
                     Err(link_err) => return Err(link_err.into()),
                 }
             }
+            // Fallback for filesystems that support neither RENAME_NOREPLACE nor linkat.
+            // Note: statat -> renameat is not atomic, so a concurrent creator could still race.
             match statat(destination, name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(_) => Err(io::ErrorKind::AlreadyExists.into()),
                 Err(Errno::NOENT) => renameat(staging, name, destination, name).map_err(Into::into),

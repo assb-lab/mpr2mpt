@@ -200,12 +200,25 @@ const LAUNCHER_WATCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl App {
     fn new(args: Args) -> io::Result<Self> {
-        let initial_is_file = args.input.as_deref().is_some_and(Path::is_file);
+        let initial_file = args
+            .input
+            .as_deref()
+            .filter(|path| path.is_file())
+            .and_then(|path| path.canonicalize().ok());
         let browser = Browser::open(args.input.as_deref().unwrap_or_else(|| Path::new(".")))?;
-        let output = args.output.map(std::path::absolute).transpose()?;
-        let output_target = (output.is_some() && initial_is_file)
-            .then(|| browser.selected().map(|entry| entry.path.clone()))
-            .flatten();
+        let mut output = args.output.map(std::path::absolute).transpose()?;
+        let output_target = if output.is_some() && args.input.as_deref().is_some_and(Path::is_file)
+        {
+            match initial_file.or_else(|| browser.selected().map(|entry| entry.path.clone())) {
+                Some(path) => Some(path),
+                None => {
+                    output = None;
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut app = Self {
             plain_icons: args.plain_icons,
             browser,
@@ -619,9 +632,20 @@ impl App {
 
     fn poll_launchers(&mut self) {
         let mut error = None;
-        self.launchers.retain_mut(|(child, started)| {
+        let mut remaining = Vec::with_capacity(self.launchers.len());
+        for (mut child, started) in self.launchers.drain(..) {
             match child.try_wait() {
-                Ok(None) => return started.elapsed() < LAUNCHER_WATCH_TIMEOUT,
+                Ok(None) if started.elapsed() < LAUNCHER_WATCH_TIMEOUT => {
+                    remaining.push((child, started));
+                }
+                Ok(None) => {
+                    // Detach a reaper thread so long-lived launchers do not become zombies.
+                    let _ = std::thread::Builder::new()
+                        .name("mpr2mpt-reap".into())
+                        .spawn(move || {
+                            let _ = child.wait();
+                        });
+                }
                 Ok(Some(status)) if status.success() => {}
                 Ok(Some(status)) => {
                     error = Some(format!("Default app launcher exited with {status}."))
@@ -632,8 +656,8 @@ impl App {
                     ))
                 }
             }
-            false
-        });
+        }
+        self.launchers = remaining;
         if let Some(error) = error {
             self.show_error(error);
         }
@@ -642,12 +666,18 @@ impl App {
     fn reload(&mut self) {
         let selected_before = self.browser.selected().map(|entry| entry.path.clone());
         let was_focused = self.preview_focused;
-        let inspection_metadata_start = match &self.detail {
-            Detail::Inspection(view) => Some(view.metadata_start),
-            _ => None,
+        let previous_inspection = match std::mem::replace(&mut self.detail, Detail::Empty) {
+            Detail::Inspection(view) => Some(view),
+            other => {
+                self.detail = other;
+                None
+            }
         };
         let (row, column) = (self.preview_row, self.preview_column);
         if let Err(error) = self.browser.reload() {
+            if let Some(view) = previous_inspection {
+                self.detail = Detail::Inspection(view);
+            }
             self.show_error(error);
             return;
         }
@@ -659,22 +689,40 @@ impl App {
             .browser
             .selected()
             .filter(|entry| entry.path == path);
-        if let (Some(metadata_start), Some(entry)) = (inspection_metadata_start, still_selected)
+        if let (Some(previous), Some(entry)) = (previous_inspection, still_selected)
             && entry.kind == Kind::Mpr
-            && let Ok(inspection) = mpr2mpt::inspect(&entry.path)
         {
-            let mut view = InspectionView::from(inspection);
-            view.metadata_start = shift(metadata_start, 0, view.metadata.len());
-            self.detail = Detail::Inspection(view);
-            self.preview_focused = was_focused;
-            self.move_details(row as isize, column as isize);
+            let current_sig = preview::file_signature(&entry.path);
+            if previous.source_meta.is_some() && previous.source_meta == current_sig {
+                self.detail = Detail::Inspection(previous);
+                self.preview_focused = was_focused;
+                self.restore_preview_position(row, column);
+            } else if let Ok(inspection) = mpr2mpt::inspect(&entry.path) {
+                let mut view = InspectionView::from(inspection);
+                view.source_meta = current_sig;
+                view.metadata_start = shift(previous.metadata_start, 0, view.metadata.len());
+                self.detail = Detail::Inspection(view);
+                self.preview_focused = was_focused;
+                self.restore_preview_position(row, column);
+            }
         } else if was_focused
             && still_selected.is_some()
             && matches!(self.detail, Detail::Mpt(_) | Detail::Text(_))
         {
             self.preview_focused = true;
-            self.move_details(row as isize, column as isize);
+            self.restore_preview_position(row, column);
         }
+    }
+
+    fn restore_preview_position(&mut self, row: usize, column: usize) {
+        let (row_count, column_count) = match &self.detail {
+            Detail::Mpt(preview) => (preview.rows(), preview.columns()),
+            Detail::Inspection(preview) => (preview.table.rows(), preview.table.columns()),
+            Detail::Text(preview) => (preview.rows(), preview.columns()),
+            _ => return,
+        };
+        self.preview_row = shift(0, row as isize, row_count);
+        self.preview_column = shift(0, column as isize, column_count);
     }
 
     fn update_detail(&mut self) {
@@ -943,7 +991,9 @@ impl App {
         };
         match mpr2mpt::inspect(&entry.path) {
             Ok(inspection) => {
-                self.detail = Detail::Inspection(InspectionView::from(inspection));
+                let mut view = InspectionView::from(inspection);
+                view.source_meta = preview::file_signature(&entry.path);
+                self.detail = Detail::Inspection(view);
                 self.show_report = false;
                 self.preview_column = 0;
                 self.preview_row = 0;
@@ -1452,5 +1502,40 @@ mod navigation_tests {
             },
         ]);
         assert!(pending.existing.is_empty());
+    }
+
+    #[test]
+    fn reload_preserves_inspection_without_moving_report_cursor() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("sample.mpr");
+        fs::write(&path, []).unwrap();
+        let mut app = app_at(&path);
+        let mut view = InspectionView::from(mpr2mpt::Inspection {
+            metadata: vec![("Technique".into(), "CV".into())],
+            headings: vec!["time/s".into(), "Ewe/V".into()],
+            rows: vec![
+                vec!["0".into(), "1".into()],
+                vec!["1".into(), "2".into()],
+                vec!["2".into(), "3".into()],
+            ],
+            total_rows: 3,
+        });
+        view.source_meta = preview::file_signature(&path);
+        app.detail = Detail::Inspection(view);
+        app.preview_row = 2;
+        app.preview_column = 1;
+        app.report = Some(Report::new(vec![
+            scratch.path().join("a.mpr"),
+            scratch.path().join("b.mpr"),
+            scratch.path().join("c.mpr"),
+        ]));
+        app.show_report = true;
+
+        app.reload();
+
+        assert!(matches!(app.detail, Detail::Inspection(_)));
+        assert_eq!(app.preview_row, 2);
+        assert_eq!(app.preview_column, 1);
+        assert_eq!(app.report.as_ref().unwrap().cursor, 0);
     }
 }
