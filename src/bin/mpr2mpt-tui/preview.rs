@@ -24,6 +24,7 @@ pub(super) struct InspectionView {
     pub(super) metadata: Vec<(String, String)>,
     pub(super) metadata_start: usize,
     pub(super) table: MptPreview,
+    pub(super) source_meta: Option<(u64, Option<std::time::SystemTime>)>,
 }
 
 pub(super) struct TextPreview {
@@ -131,8 +132,14 @@ impl From<mpr2mpt::Inspection> for InspectionView {
                 headings: inspection.headings,
                 data: inspection.rows,
             },
+            source_meta: None,
         }
     }
+}
+
+pub(super) fn file_signature(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()))
 }
 
 impl MptPreview {

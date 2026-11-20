@@ -429,6 +429,24 @@ fn batch_falls_back_when_acl_allows_files_but_forbids_scratch_directories() {
 }
 
 #[test]
+fn single_conversion_rejects_directory_syntax_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("sample.mpr");
+    fs::write(&input, sample()).unwrap();
+    for suffix in ["out.mpt/", "out.mpt/."] {
+        let output = dir.path().join(suffix);
+        assert!(
+            matches!(
+                mpr2mpt::convert(&input, Some(&output)),
+                Err(ConversionError::OutputName(_))
+            ),
+            "{suffix}"
+        );
+    }
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
 fn batch_does_not_group_directory_syntax_with_a_file_output() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("valid.mpt");

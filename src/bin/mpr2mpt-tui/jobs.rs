@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 
-use mpr2mpt::batch::{BatchJob, BatchOutcome, convert_batch_with_approvals};
+use mpr2mpt::batch::{BatchJob, BatchOutcome, convert_batch_with_approvals, preflight_destinations};
 use mpr2mpt::overwrite::OverwriteApproval;
 use mpr2mpt::{ConversionError, ConversionReport};
 
@@ -32,9 +32,11 @@ pub(super) struct PendingOverwrite {
 
 impl PendingOverwrite {
     pub(super) fn scan(jobs: Vec<BatchJob>) -> Self {
+        let preflight = preflight_destinations(&jobs);
         let existing = jobs
             .iter()
             .enumerate()
+            .filter(|(index, _)| preflight.get(*index).is_none_or(Option::is_none))
             .filter_map(|(index, job)| {
                 let path = job.destination();
                 let approval = OverwriteApproval::capture(&path).transpose()?;

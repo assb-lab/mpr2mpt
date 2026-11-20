@@ -36,6 +36,15 @@ pub struct BatchOutcome {
     pub result: Result<ConversionReport, ConversionError>,
 }
 
+/// Preflight batch destinations to identify duplicate or invalid outputs before prompting.
+pub fn preflight_destinations(jobs: &[BatchJob]) -> Vec<Option<ConversionError>> {
+    let outputs: Vec<_> = jobs.iter().map(BatchJob::destination).collect();
+    check_destinations(&outputs)
+        .into_iter()
+        .map(|check| check.error)
+        .collect()
+}
+
 /// Convert the jobs and report each outcome as it becomes available.
 /// Callbacks may run concurrently. Destination checks reject known collisions before writing.
 /// If filesystem alias checks are unavailable, exact duplicates are still rejected and other
@@ -117,14 +126,8 @@ fn check_destinations(outputs: &[PathBuf]) -> Vec<DestinationCheck> {
 
     let mut groups: HashMap<PathBuf, Vec<(usize, &OsStr)>> = HashMap::new();
     for (index, output) in outputs.iter().enumerate() {
-        let bytes = output.as_os_str().as_encoded_bytes();
-        if bytes
-            .strip_suffix(b".")
-            .unwrap_or(bytes)
-            .last()
-            .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
-        {
-            // Path::file_name normalizes these suffixes, but the raw path asks for a directory.
+        if crate::has_invalid_output_name(output) {
+            // Path::file_name normalizes trailing separators and "/.", but the raw path asks for a directory.
             checks[index].error = Some(ConversionError::OutputName(output.clone()));
             continue;
         }

@@ -88,7 +88,7 @@ pub(super) fn copy_text(_: &str) -> io::Result<()> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn copy_into(source: &Path, destination_directory: &Path) -> io::Result<PathBuf> {
-    use rustix::fs::{CWD, Mode, OFlags, RenameFlags, openat, renameat_with};
+    use rustix::fs::{CWD, Mode, OFlags, openat};
     use std::fs::{self, File, Permissions};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -151,14 +151,12 @@ pub(super) fn copy_into(source: &Path, destination_directory: &Path) -> io::Resu
         .iter()
         .try_for_each(|(path, mode)| fs::set_permissions(path, Permissions::from_mode(*mode)))
         .and_then(|()| {
-            renameat_with(
+            publish_staged(
                 &staging_file,
-                name,
                 &destination,
                 name,
-                RenameFlags::NOREPLACE,
+                published_directory.is_some(),
             )
-            .map_err(io::Error::from)
         });
     if let Err(error) = published {
         for (path, _) in directory_permissions.iter().rev() {
@@ -175,6 +173,42 @@ pub(super) fn copy_into(source: &Path, destination_directory: &Path) -> io::Resu
         })?;
     }
     Ok(destination_directory.join(name))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn publish_staged(
+    staging: &std::fs::File,
+    destination: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    is_directory: bool,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, RenameFlags, linkat, renameat_with};
+    use rustix::io::Errno;
+
+    match renameat_with(staging, name, destination, name, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP | Errno::INVAL) => {
+            if !is_directory {
+                return match linkat(staging, name, destination, name, AtFlags::empty()) {
+                    Ok(()) => Ok(()),
+                    Err(Errno::PERM | Errno::NOTSUP | Errno::OPNOTSUPP | Errno::NOSYS) => {
+                        Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "This filesystem does not support atomic no-overwrite copy",
+                        ))
+                    }
+                    Err(link_err) => Err(link_err.into()),
+                };
+            }
+            // Do not fall back to a non-atomic statat + renameat, which could clobber
+            // a concurrently created destination.
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "This filesystem does not support atomic no-overwrite directory copy",
+            ))
+        }
+        Err(errno) => Err(errno.into()),
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
